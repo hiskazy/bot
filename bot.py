@@ -5,6 +5,7 @@ import re
 import time
 import json
 import threading
+import random
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -35,12 +36,137 @@ SUBSCRIPTION_DAYS = {
 
 TRIAL_DAYS = 14
 
-# Отключаем прокси
-for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy']:
-    os.environ.pop(var, None)
-os.environ['NO_PROXY'] = '*'
+# ==================== ОБХОД БЛОКИРОВОК ====================
 
-# СОЗДАНИЕ БАЗЫ ДАННЫХ
+# Список рабочих прокси (публичные, обновляются)
+PROXY_LIST = [
+    None,  # прямой доступ
+    # HTTP/HTTPS прокси
+    {"http": "http://45.141.100.135:8080", "https": "http://45.141.100.135:8080"},
+    {"http": "http://45.141.100.135:8888", "https": "http://45.141.100.135:8888"},
+    {"http": "http://194.67.213.85:8080", "https": "http://194.67.213.85:8080"},
+    {"http": "http://185.197.158.70:8080", "https": "http://185.197.158.70:8080"},
+    {"http": "http://188.130.158.70:8080", "https": "http://188.130.158.70:8080"},
+    # SOCKS5 прокси (лучше работают)
+    {"http": "socks5://192.252.213.56:1080", "https": "socks5://192.252.213.56:1080"},
+    {"http": "socks5://50.175.96.138:1080", "https": "socks5://50.175.96.138:1080"},
+    {"http": "socks5://66.219.160.148:1080", "https": "socks5://66.219.160.148:1080"},
+]
+
+# Зеркала Telegram API
+MIRRORS = [
+    "https://api.telegram.org",
+    "https://telegram-api.yax.workers.dev",
+    "https://tg-api-pw.cf",
+    "https://tg-api.su",
+    "https://tgbotapi.tech",
+    "https://tg-bot-api.pages.dev",
+    "https://telegram-bot-api.pages.dev",
+    "https://tapi.bennythink.workers.dev",
+]
+
+current_mirror = 0
+current_proxy = 0
+last_successful = {"mirror": 0, "proxy": 0}
+
+def get_working_connection():
+    """Пытается найти работающее соединение"""
+    global current_mirror, current_proxy, last_successful
+    
+    for m in range(len(MIRRORS)):
+        mirror_idx = (current_mirror + m) % len(MIRRORS)
+        mirror = MIRRORS[mirror_idx]
+        
+        for p in range(len(PROXY_LIST)):
+            proxy_idx = (current_proxy + p) % len(PROXY_LIST)
+            proxy = PROXY_LIST[proxy_idx]
+            
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                if proxy:
+                    session.proxies.update(proxy)
+                
+                test_url = f"{mirror}/bot{BOT_TOKEN}/getMe"
+                response = session.get(test_url, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("ok"):
+                        print(f"✅ Работает: {mirror}, прокси: {proxy if proxy else 'прямое'}")
+                        last_successful = {"mirror": mirror_idx, "proxy": proxy_idx}
+                        return session, mirror
+            except:
+                print(f"❌ Не работает: {mirror}, прокси: {proxy if proxy else 'прямое'}")
+                continue
+    
+    # Возвращаем последний рабочий если был
+    if last_successful["mirror"]:
+        mirror = MIRRORS[last_successful["mirror"]]
+        proxy = PROXY_LIST[last_successful["proxy"]]
+        session = requests.Session()
+        session.trust_env = False
+        if proxy:
+            session.proxies.update(proxy)
+        return session, mirror
+    
+    # Если ничего не работает - возвращаем обычную сессию
+    print("⚠️ Не найдено рабочих соединений, использую прямой доступ")
+    session = requests.Session()
+    session.trust_env = False
+    return session, "https://api.telegram.org"
+
+def send_request(method, params=None, json_data=None, retries=3):
+    """Отправка запроса с повторными попытками через разные прокси"""
+    for attempt in range(retries):
+        try:
+            session, base = get_working_connection()
+            url = f"{base}/bot{BOT_TOKEN}/{method}"
+            
+            if json_data:
+                response = session.post(url, json=json_data, timeout=15)
+            else:
+                response = session.get(url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("ok"):
+                    return result
+                else:
+                    print(f"Ошибка API {method}: {result}")
+                    return result
+            else:
+                print(f"HTTP ошибка {response.status_code} для {method}")
+                
+        except Exception as e:
+            print(f"Попытка {attempt+1} для {method} failed: {e}")
+            time.sleep(1)
+    
+    return {"ok": False, "error": "Превышено количество попыток"}
+
+def send(chat_id, text, retries=3):
+    for attempt in range(retries):
+        try:
+            result = send_request("sendMessage", params={"chat_id": chat_id, "text": text})
+            if result.get("ok"):
+                return
+        except:
+            pass
+        time.sleep(1)
+
+def send_inline_keyboard(chat_id, text, buttons, retries=3):
+    reply_markup = {"inline_keyboard": buttons}
+    for attempt in range(retries):
+        try:
+            result = send_request("sendMessage", json_data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)})
+            if result.get("ok"):
+                return
+        except:
+            pass
+        time.sleep(1)
+
+# ==================== БАЗА ДАННЫХ ====================
+
 conn = sqlite3.connect("saas.db", check_same_thread=False)
 cur = conn.cursor()
 
@@ -142,23 +268,7 @@ except: pass
 conn.commit()
 conn.close()
 
-
-def send(chat_id, text):
-    try:
-        requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": chat_id, "text": text}, proxies={})
-    except Exception as e:
-        print(f"Ошибка отправки: {e}")
-
-
-def send_inline_keyboard(chat_id, text, buttons):
-    reply_markup = {"inline_keyboard": buttons}
-    try:
-        requests.post(f"{BASE_URL}/sendMessage",
-                      data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)},
-                      proxies={})
-    except Exception as e:
-        print(f"Ошибка отправки: {e}")
-
+# ==================== ФУНКЦИИ ====================
 
 def send_admin_notification(admin_id, booking_info):
     msg = f"📅 Новая запись!\n\n"
@@ -169,13 +279,11 @@ def send_admin_notification(admin_id, booking_info):
     msg += f"⏰ Время: {booking_info['booking_time']}\n"
     msg += f"🆔 ID записи: {booking_info['booking_id']}\n\n"
     msg += f"Статус: ожидает подтверждения"
-
     buttons = [
         [{"text": "✅ Подтвердить", "callback_data": f"confirm_{booking_info['booking_id']}"}],
         [{"text": "❌ Отменить", "callback_data": f"reject_{booking_info['booking_id']}"}]
     ]
     send_inline_keyboard(admin_id, msg, buttons)
-
 
 def check_reminders():
     while True:
@@ -199,7 +307,6 @@ def check_reminders():
         except Exception as e:
             print(f"Ошибка проверки напоминаний: {e}")
         time.sleep(60)
-
 
 def check_subscription_expiry():
     while True:
@@ -233,7 +340,6 @@ def check_subscription_expiry():
             print(f"Ошибка проверки подписок: {e}")
         time.sleep(3600)
 
-
 def is_admin(user_id):
     if user_id == MASTER_ADMIN_ID:
         return True
@@ -244,18 +350,13 @@ def is_admin(user_id):
     conn.close()
     return result is not None
 
-
 def get_admin_business(user_id):
     conn = sqlite3.connect("saas.db")
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, business_name, subscription_end, is_trial, working_start, working_end
-        FROM businesses WHERE owner_id=?
-    """, (user_id,))
+    cur.execute("SELECT id, business_name, subscription_end, is_trial, working_start, working_end FROM businesses WHERE owner_id=?", (user_id,))
     result = cur.fetchone()
     conn.close()
     return result
-
 
 def get_booking_stats(business_id, period):
     conn = sqlite3.connect("saas.db")
@@ -273,7 +374,6 @@ def get_booking_stats(business_id, period):
     results = cur.fetchall()
     conn.close()
     return results
-
 
 def get_subscription_status(user_id):
     business = get_admin_business(user_id)
@@ -293,7 +393,6 @@ def get_subscription_status(user_id):
     else:
         return f"активна до {subscription_end.strftime('%d.%m.%Y')}"
 
-
 def is_valid_booking_time(business_id, date_str, time_str):
     booking_datetime = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     if booking_datetime < datetime.now():
@@ -310,40 +409,52 @@ def is_valid_booking_time(business_id, date_str, time_str):
             return False, f"Барбершоп работает с {working_start}:00 до {working_end}:00"
     return True, "OK"
 
-
 def create_payment_link(user_id, business_id, amount_rub, plan, days):
     try:
         url = "https://pay.crypt.bot/api/createInvoice"
         headers = {"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN, "Content-Type": "application/json"}
         data = {"amount": str(amount_rub), "currency_type": "fiat", "fiat": "RUB", "accepted_assets": "USDT,BTC,TON", "description": f"Подписка на бот на {days} дней", "paid_btn_name": "openBot", "paid_btn_url": f"https://t.me/{BOT_USERNAME}", "payload": f"user_{user_id}_business_{business_id}_plan_{plan}", "expires_in": 3600}
-        response = requests.post(url, headers=headers, json=data, proxies={})
-        result = response.json()
-        if result.get("ok"):
-            return result["result"]["bot_invoice_url"]
-        else:
-            print(f"Ошибка Crypto Bot: {result}")
-            return None
+        
+        # Пробуем через разные прокси
+        for proxy in PROXY_LIST:
+            try:
+                session = requests.Session()
+                if proxy:
+                    session.proxies.update(proxy)
+                response = session.post(url, headers=headers, json=data, timeout=10)
+                result = response.json()
+                if result.get("ok"):
+                    return result["result"]["bot_invoice_url"]
+            except:
+                continue
+        return None
     except Exception as e:
         print(f"Ошибка создания платежа: {e}")
         return None
-
 
 def check_payment_status(payload):
     try:
         url = "https://pay.crypt.bot/api/getInvoices"
         headers = {"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN, "Content-Type": "application/json"}
         params = {"payload": payload}
-        response = requests.get(url, headers=headers, params=params, proxies={})
-        result = response.json()
-        if result.get("ok") and result.get("result"):
-            for invoice in result["result"]["items"]:
-                if invoice.get("status") == "paid":
-                    return True, invoice
+        
+        for proxy in PROXY_LIST:
+            try:
+                session = requests.Session()
+                if proxy:
+                    session.proxies.update(proxy)
+                response = session.get(url, headers=headers, params=params, timeout=10)
+                result = response.json()
+                if result.get("ok") and result.get("result"):
+                    for invoice in result["result"]["items"]:
+                        if invoice.get("status") == "paid":
+                            return True, invoice
+            except:
+                continue
         return False, None
     except Exception as e:
         print(f"Ошибка проверки платежа: {e}")
         return False, None
-
 
 def activate_subscription(business_id, days):
     conn = sqlite3.connect("saas.db")
@@ -365,7 +476,6 @@ def activate_subscription(business_id, days):
     conn.close()
     return new_end_str
 
-
 def generate_unique_slug(business_name, user_id):
     base_slug = re.sub(r'[^a-z0-9]', '-', business_name.lower())
     base_slug = re.sub(r'-+', '-', base_slug).strip('-')
@@ -382,27 +492,31 @@ def generate_unique_slug(business_name, user_id):
     conn.close()
     return slug
 
+# ==================== ЗАПУСК ====================
 
 reminder_thread = threading.Thread(target=check_reminders, daemon=True)
 reminder_thread.start()
 subscription_thread = threading.Thread(target=check_subscription_expiry, daemon=True)
 subscription_thread.start()
 
-print(f"Бот запущен. Режим: polling")
+print(f"Бот запущен. Пробный период: {TRIAL_DAYS} дней")
+print("Идёт поиск рабочего соединения с Telegram API...")
 
 # Удаляем вебхук перед запуском polling
-try:
-    requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", proxies={})
-    print("Вебхук удалён")
-except:
-    pass
+send_request("deleteWebhook")
+print("Вебхук удалён")
+
+offset = 0
 
 while True:
     try:
-        response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 30}, proxies={})
-        data = response.json()
-
-        for update in data.get("result", []):
+        response = send_request("getUpdates", params={"offset": offset, "timeout": 30})
+        
+        if not response.get("ok"):
+            time.sleep(5)
+            continue
+            
+        for update in response.get("result", []):
             offset = update["update_id"] + 1
 
             if "callback_query" in update:
@@ -411,7 +525,7 @@ while True:
                 user_id = callback["from"]["id"]
                 data_callback = callback["data"]
                 
-                requests.post(f"{BASE_URL}/answerCallbackQuery", data={"callback_query_id": callback["id"]}, proxies={})
+                send_request("answerCallbackQuery", json_data={"callback_query_id": callback["id"]})
                 
                 if data_callback.startswith("confirm_"):
                     booking_id = int(data_callback.split("_")[1])
@@ -438,7 +552,7 @@ while True:
                     conn.close()
                     send(chat_id, f"❌ Запись #{booking_id} отменена!")
                     if row and row[0]:
-                        send(row[0], f"❌ Ваша запись отменена. Пожалуйста, свяжитесь с барбершопом.")
+                        send(row[0], f"❌ Ваша запись отменена. Свяжитесь с барбершопом.")
                     continue
                 
                 elif data_callback.startswith("cancel_"):
@@ -493,7 +607,7 @@ while True:
                 
                 elif data_callback == "edit_work_hours":
                     editing_states[user_id] = {"step": "edit_start"}
-                    send(chat_id, "Введите время начала работы (в часах от 0 до 23):\nПример: 9")
+                    send(chat_id, "Введите время начала работы (0-23):\nПример: 9")
                     continue
                 
                 elif data_callback == "stats_day":
@@ -574,7 +688,7 @@ while True:
                         [{"text": "За месяц", "callback_data": "stats_month"}],
                         [{"text": "Назад", "callback_data": "back_to_services"}]
                     ]
-                    send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
+                    send_inline_keyboard(chat_id, "📊 Выберите период:", buttons)
                     continue
                 
                 elif data_callback == "buy_subscription":
@@ -609,7 +723,7 @@ while True:
                     payment_url = create_payment_link(user_id, business_id, amount, plan, days)
                     
                     if payment_url:
-                        send(chat_id, f"💳 Оплата подписки\n\nСумма: {amount} ₽\nПериод: {days} дней\n\n🔗 [Нажмите для оплаты]({payment_url})\n\nСпособы оплаты:\n• Банковская карта\n• СБП\n• Криптовалюта\n\n✅ После оплаты нажмите «Проверить оплату»")
+                        send(chat_id, f"💳 Оплата подписки\n\nСумма: {amount} ₽\nПериод: {days} дней\n\n🔗 [Нажмите для оплаты]({payment_url})\n\n✅ После оплаты нажмите «Проверить оплату»")
                         buttons = [[{"text": "🔄 Проверить оплату", "callback_data": f"check_payment_{business_id}_{plan}_{user_id}"}]]
                         send_inline_keyboard(chat_id, "Ожидаем оплату...", buttons)
                     else:
@@ -634,10 +748,12 @@ while True:
                         else:
                             days = SUBSCRIPTION_DAYS["year"]
                         new_end = activate_subscription(business_id, days)
-                        send(chat_id, f"✅ Подписка успешно активирована!\n\n📅 Действует до: {new_end}")
+                        send(chat_id, f"✅ Подписка активирована!\n📅 Действует до: {new_end}")
                     else:
-                        send(chat_id, "⏳ Платёж ещё не подтверждён.\n\nЕсли вы уже оплатили, подождите 1-2 минуты.")
+                        send(chat_id, "⏳ Платёж ещё не подтверждён.\n\nЕсли оплатили, подождите 1-2 минуты.")
                     continue
+                
+                continue
 
             if "message" not in update:
                 continue
@@ -649,13 +765,13 @@ while True:
 
             print(f"Сообщение от {user_id}: {text}")
 
-            # ADD ADMIN - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+            # ADD ADMIN - только для главного админа
             if text == "/addadmin" and user_id == MASTER_ADMIN_ID:
                 users[user_id] = {"step": "add_admin"}
-                send(chat_id, "✉️ Введите Telegram ID пользователя, которого хотите сделать администратором.\n\nℹ️ Чтобы узнать ID, попросите его отправить команду /id.")
+                send(chat_id, "✉️ Введите Telegram ID пользователя для добавления в администраторы.")
                 continue
 
-            # ADMINS - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+            # ADMINS - только для главного админа
             if text == "/admins" and user_id == MASTER_ADMIN_ID:
                 conn = sqlite3.connect("saas.db")
                 cur = conn.cursor()
@@ -665,28 +781,27 @@ while True:
                 if not admins_list:
                     send(chat_id, "👥 Список администраторов пуст.")
                 else:
-                    msg = "👥 **Список администраторов:**\n\n"
+                    msg = "👥 Список администраторов:\n\n"
                     for admin in admins_list:
-                        added_by = "главный админ" if admin[2] == MASTER_ADMIN_ID else f"администратором {admin[2]}"
-                        msg += f"🆔 `{admin[0]}`\n   📍 Бизнес ID: {admin[1]}\n   👤 Добавлен: {added_by}\n   📅 {admin[3]}\n\n"
+                        added_by = "главный админ" if admin[2] == MASTER_ADMIN_ID else f"админом {admin[2]}"
+                        msg += f"🆔 {admin[0]}\n   📍 Бизнес: {admin[1]}\n   👤 Добавлен: {added_by}\n   📅 {admin[3]}\n\n"
                     send(chat_id, msg)
                 continue
 
             if text == "/cancel_booking":
                 conn = sqlite3.connect("saas.db")
                 cur = conn.cursor()
-                cur.execute("SELECT id, service_name, booking_date, booking_time, status FROM bookings WHERE client_id=? AND status='pending'", (user_id,))
+                cur.execute("SELECT id, service_name, booking_date, booking_time FROM bookings WHERE client_id=? AND status='pending'", (user_id,))
                 bookings = cur.fetchall()
                 conn.close()
                 if not bookings:
-                    send(chat_id, "❌ У вас нет активных записей для отмены.")
+                    send(chat_id, "❌ У вас нет активных записей.")
                     continue
                 msg = "Выберите запись для отмены:\n\n"
                 buttons = []
                 for booking in bookings:
                     msg += f"🆔 {booking[0]}: {booking[1]} - {booking[2]} {booking[3]}\n"
                     buttons.append([{"text": f"Отменить #{booking[0]}", "callback_data": f"cancel_{booking[0]}"}])
-                buttons.append([{"text": "Назад", "callback_data": "back"}])
                 send_inline_keyboard(chat_id, msg, buttons)
                 continue
 
@@ -699,15 +814,14 @@ while True:
                     services = cur.fetchall()
                     conn.close()
                     if services:
-                        msg = "Выберите услугу для редактирования:\n\n"
+                        msg = "Выберите услугу:\n\n"
                         buttons = []
                         for s in services:
                             msg += f"✂️ {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
                             buttons.append([{"text": f"✏️ {s[1]}", "callback_data": f"edit_service_{s[0]}"}])
-                        buttons.append([{"text": "Назад", "callback_data": "back"}])
                         send_inline_keyboard(chat_id, msg, buttons)
                     else:
-                        send(chat_id, "У вас нет услуг. Добавьте через /addservice")
+                        send(chat_id, "У вас нет услуг.")
                 continue
 
             if text == "/deleteservice" and is_admin(user_id):
@@ -723,10 +837,9 @@ while True:
                         buttons = []
                         for s in services:
                             buttons.append([{"text": f"🗑 {s[1]}", "callback_data": f"delete_service_{s[0]}"}])
-                        buttons.append([{"text": "Назад", "callback_data": "back"}])
                         send_inline_keyboard(chat_id, msg, buttons)
                     else:
-                        send(chat_id, "У вас нет услуг для удаления.")
+                        send(chat_id, "Нет услуг для удаления.")
                 continue
 
             if text == "/stats" and is_admin(user_id):
@@ -735,12 +848,12 @@ while True:
                     [{"text": "За неделю", "callback_data": "stats_week"}],
                     [{"text": "За месяц", "callback_data": "stats_month"}]
                 ]
-                send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
+                send_inline_keyboard(chat_id, "📊 Выберите период:", buttons)
                 continue
 
             if text == "/workhours" and is_admin(user_id):
                 editing_states[user_id] = {"step": "edit_start"}
-                send(chat_id, "Введите время начала работы (в часах от 0 до 23):\nПример: 9")
+                send(chat_id, "Введите время начала работы (0-23):\nПример: 9")
                 continue
 
             if text == "/start":
@@ -769,7 +882,7 @@ while True:
                     menu = "🤖 Админ-панель\n\n"
                     menu += f"📊 Статус подписки: {status}\n\n"
                     menu += "Команды:\n"
-                    menu += "/register - зарегистрировать барбершоп\n"
+                    menu += "/register - регистрация барбершопа\n"
                     menu += "/mybusiness - мой барбершоп\n"
                     menu += "/addservice - добавить услугу\n"
                     menu += "/services - мои услуги\n"
@@ -778,12 +891,12 @@ while True:
                     menu += "/bookings - записи клиентов\n"
                     menu += "/stats - статистика\n"
                     menu += "/workhours - часы работы\n"
-                    menu += "/getlink - получить ссылку\n"
+                    menu += "/getlink - ссылка для клиентов\n"
                     menu += "/subscription - управление подпиской"
                     if user_id == MASTER_ADMIN_ID:
                         menu += "\n\n👑 Команды главного админа:\n"
-                        menu += "/addadmin - добавить администратора\n"
-                        menu += "/admins - список администраторов"
+                        menu += "/addadmin - добавить админа\n"
+                        menu += "/admins - список админов"
                     if "истекла" in status or "нет подписки" in status:
                         buttons = [[{"text": "💳 Купить подписку", "callback_data": "buy_subscription"}]]
                         send_inline_keyboard(chat_id, menu, buttons)
@@ -801,7 +914,7 @@ while True:
                     msg = "📋 Доступные барбершопы:\n\n"
                     for i, biz in enumerate(businesses, 1):
                         msg += f"{i}. {biz[1]}\n"
-                    msg += "\nВведите номер барбершопа:"
+                    msg += "\nВведите номер:"
                     client_states[user_id] = {"step": "select_business", "businesses": businesses}
                     send(chat_id, msg)
                 continue
@@ -812,16 +925,10 @@ while True:
                 if business and "истекла" not in status and "нет" not in status and business[2]:
                     end_date = business[2]
                     days_left = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.now()).days
-                    msg = f"💳 Управление подпиской\n\n"
-                    msg += f"📊 Статус: {status}\n"
-                    msg += f"📅 Действует до: {end_date}\n"
-                    msg += f"⏰ Осталось дней: {days_left}\n\n"
-                    msg += "Хотите продлить? Нажмите на кнопку ниже."
+                    msg = f"💳 Подписка\n📊 {status}\n📅 Действует до: {end_date}\n⏰ Осталось: {days_left} дн."
                 else:
-                    msg = f"💳 Управление подпиской\n\n"
-                    msg += f"📊 Статус: {status}\n\n"
-                    msg += "Подписка не активна. Нажмите на кнопку ниже для оплаты."
-                buttons = [[{"text": "💳 Купить/Продлить подписку", "callback_data": "buy_subscription"}]]
+                    msg = f"💳 Подписка не активна.\n📊 {status}"
+                buttons = [[{"text": "💳 Купить/Продлить", "callback_data": "buy_subscription"}]]
                 send_inline_keyboard(chat_id, msg, buttons)
                 continue
 
@@ -846,7 +953,7 @@ while True:
                     cur.execute("SELECT address, phone, working_start, working_end FROM businesses WHERE id=?", (business[0],))
                     info = cur.fetchone()
                     conn.close()
-                    send(chat_id, f"🏪 {business[1]}\n📍 {info[0]}\n📞 {info[1]}\n⏰ Работаем: {info[2]}:00 - {info[3]}:00")
+                    send(chat_id, f"🏪 {business[1]}\n📍 {info[0]}\n📞 {info[1]}\n⏰ {info[2]}:00-{info[3]}:00")
                 else:
                     send(chat_id, "❌ Барбершоп не зарегистрирован.")
                 continue
@@ -854,12 +961,12 @@ while True:
             if text == "/addservice" and is_admin(user_id):
                 business = get_admin_business(user_id)
                 if not business:
-                    send(chat_id, "❌ Сначала зарегистрируйте барбершоп через /register")
+                    send(chat_id, "❌ Сначала зарегистрируйте барбершоп.")
                     continue
                 if business[2]:
                     end_date = datetime.strptime(business[2], "%Y-%m-%d")
                     if end_date < datetime.now():
-                        send(chat_id, "❌ Ваша подписка истекла. Продлите её через /subscription")
+                        send(chat_id, "❌ Подписка истекла. Продлите через /subscription")
                         continue
                 users[user_id] = {"step": "service_name", "business_id": business[0]}
                 send(chat_id, "Введите название услуги:")
@@ -879,7 +986,7 @@ while True:
                             msg += f"✂️ {s[0]} - {s[2]} руб. ({s[1]} мин)\n"
                         send(chat_id, msg)
                     else:
-                        send(chat_id, "У вас нет услуг. Добавьте через /addservice")
+                        send(chat_id, "У вас нет услуг.")
                 continue
 
             if text == "/bookings" and is_admin(user_id):
@@ -891,10 +998,10 @@ while True:
                     bookings = cur.fetchall()
                     conn.close()
                     if bookings:
-                        msg = "📅 Записи клиентов:\n\n"
+                        msg = "📅 Записи:\n\n"
                         for b in bookings:
-                            status_emoji = "✅" if b[6] == "confirmed" else "⏳" if b[6] == "pending" else "❌"
-                            msg += f"{status_emoji} #{b[0]}: {b[1]} ({b[2]})\n💇 {b[3]}\n📅 {b[4]} {b[5]}\n\n"
+                            emoji = "✅" if b[6] == "confirmed" else "⏳" if b[6] == "pending" else "❌"
+                            msg += f"{emoji} #{b[0]}: {b[1]} ({b[2]})\n💇 {b[3]}\n📅 {b[4]} {b[5]}\n\n"
                         send(chat_id, msg)
                     else:
                         send(chat_id, "Нет записей")
@@ -908,20 +1015,18 @@ while True:
                     cur.execute("SELECT business_slug FROM businesses WHERE owner_id=?", (user_id,))
                     slug = cur.fetchone()
                     conn.close()
-                    if slug and slug[0]:
+                    if slug:
                         link = f"https://t.me/{BOT_USERNAME}?start={slug[0]}"
-                        send(chat_id, f"🔗 Ваша ссылка для клиентов:\n\n{link}\n\nОтправьте её клиентам!")
-                    else:
-                        send(chat_id, "❌ Ошибка: не удалось получить ссылку")
+                        send(chat_id, f"🔗 Ссылка для клиентов:\n{link}")
                 continue
 
-            # Обработка добавления администратора
+            # Добавление админа (только для главного)
             if user_id == MASTER_ADMIN_ID and user_id in users and users[user_id].get("step") == "add_admin":
                 try:
                     new_admin_id = int(text)
                     business = get_admin_business(new_admin_id)
                     if not business:
-                        send(chat_id, f"❌ Пользователь `{new_admin_id}` не зарегистрировал барбершоп. Сначала попросите его пройти регистрацию через /register")
+                        send(chat_id, f"❌ Пользователь {new_admin_id} не зарегистрировал барбершоп.")
                         del users[user_id]
                         continue
                     conn = sqlite3.connect("saas.db")
@@ -929,66 +1034,58 @@ while True:
                     cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?, ?, ?)", (new_admin_id, business[0], user_id))
                     conn.commit()
                     conn.close()
-                    send(chat_id, f"✅ Пользователь `{new_admin_id}` добавлен как администратор.")
-                    send(new_admin_id, f"🎉 Вас добавили как администратора бота! Используйте /start для входа в админ-панель.")
+                    send(chat_id, f"✅ Администратор {new_admin_id} добавлен!")
+                    send(new_admin_id, "🎉 Вас добавили администратором бота!")
                     del users[user_id]
-                except ValueError:
-                    send(chat_id, "❌ Неверный формат ID. Введите только цифры.")
-                except Exception as e:
-                    send(chat_id, f"❌ Ошибка: {e}")
+                except:
+                    send(chat_id, "❌ Введите корректный ID")
                     del users[user_id]
                 continue
 
-            # Обработка состояний для регистрации бизнеса и добавления услуг
+            # Регистрация бизнеса
             if user_id in users:
                 state = users[user_id]
-
                 if state.get("step") == "business_name":
                     state["business_name"] = text
                     state["step"] = "address"
-                    send(chat_id, "Введите адрес барбершопа:")
+                    send(chat_id, "Введите адрес:")
                     continue
-
                 if state.get("step") == "address":
                     state["address"] = text
                     state["step"] = "phone"
-                    send(chat_id, "Введите телефон барбершопа:")
+                    send(chat_id, "Введите телефон:")
                     continue
-
                 if state.get("step") == "phone":
                     slug = generate_unique_slug(state["business_name"], user_id)
                     trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
                     try:
                         conn = sqlite3.connect("saas.db")
                         cur = conn.cursor()
-                        cur.execute("INSERT INTO businesses (owner_id, business_name, business_slug, address, phone, subscription_end, is_trial, working_start, working_end) VALUES (?,?,?,?,?,?,1,9,21)", (user_id, state["business_name"], slug, state["address"], text, trial_end))
+                        cur.execute("INSERT INTO businesses (owner_id, business_name, business_slug, address, phone, subscription_end, is_trial) VALUES (?,?,?,?,?,?,1)", (user_id, state["business_name"], slug, state["address"], text, trial_end))
                         business_id = cur.lastrowid
-                        cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?,?,?)", (user_id, business_id, MASTER_ADMIN_ID))
+                        cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id) VALUES (?,?)", (user_id, business_id))
                         conn.commit()
                         conn.close()
                         link = f"https://t.me/{BOT_USERNAME}?start={slug}"
-                        send(chat_id, f"✅ Барбершоп успешно зарегистрирован!\n\n🏪 {state['business_name']}\n📍 {state['address']}\n📞 {text}\n\n🎁 Пробный период: {TRIAL_DAYS} дней бесплатно!\n📅 Подписка активна до: {trial_end}\n\n🔗 Ваша ссылка:\n{link}\n\n📋 Теперь добавьте услуги через /addservice")
+                        send(chat_id, f"✅ Барбершоп зарегистрирован!\n🎁 Пробный период {TRIAL_DAYS} дней\n📅 До {trial_end}\n\n🔗 {link}\n\n📋 Добавьте услуги через /addservice")
                         del users[user_id]
                     except Exception as e:
                         send(chat_id, f"❌ Ошибка: {e}")
                         del users[user_id]
                     continue
-
                 if state.get("step") == "service_name":
                     state["service_name"] = text
                     state["step"] = "duration"
-                    send(chat_id, "Введите длительность в минутах:")
+                    send(chat_id, "Введите длительность (мин):")
                     continue
-
                 if state.get("step") == "duration":
                     if text.isdigit():
                         state["duration"] = int(text)
                         state["step"] = "price"
-                        send(chat_id, "Введите стоимость в рублях:")
+                        send(chat_id, "Введите цену (руб):")
                     else:
                         send(chat_id, "❌ Введите число")
                     continue
-
                 if state.get("step") == "price":
                     if text.isdigit():
                         try:
@@ -1006,20 +1103,19 @@ while True:
                         send(chat_id, "❌ Введите число")
                     continue
 
-            # Обработка редактирования времени работы
+            # Редактирование времени работы
             if user_id in editing_states and editing_states[user_id].get("step") == "edit_start":
                 if text.isdigit():
                     hour = int(text)
                     if 0 <= hour <= 23:
                         editing_states[user_id]["start"] = hour
                         editing_states[user_id]["step"] = "edit_end"
-                        send(chat_id, f"Время начала: {hour}:00\n\nВведите время окончания работы (в часах от 0 до 23):")
+                        send(chat_id, f"Начало: {hour}:00\nВведите время окончания (0-23):")
                     else:
-                        send(chat_id, "❌ Введите число от 0 до 23")
+                        send(chat_id, "❌ Введите 0-23")
                 else:
                     send(chat_id, "❌ Введите число")
                 continue
-
             if user_id in editing_states and editing_states[user_id].get("step") == "edit_end":
                 if text.isdigit():
                     hour = int(text)
@@ -1032,28 +1128,26 @@ while True:
                             cur.execute("UPDATE businesses SET working_start=?, working_end=? WHERE id=?", (start_hour, hour, business[0]))
                             conn.commit()
                             conn.close()
-                            send(chat_id, f"✅ Часы работы обновлены: {start_hour}:00 - {hour}:00")
+                            send(chat_id, f"✅ Часы работы: {start_hour}:00-{hour}:00")
                         del editing_states[user_id]
                     else:
-                        send(chat_id, "❌ Введите число от 0 до 23")
+                        send(chat_id, "❌ Введите 0-23")
                 else:
                     send(chat_id, "❌ Введите число")
                 continue
 
-            # Обработка редактирования услуги
+            # Редактирование услуги
             if user_id in editing_states:
                 state = editing_states[user_id]
-
                 if state.get("step") == "edit_name":
                     conn = sqlite3.connect("saas.db")
                     cur = conn.cursor()
                     cur.execute("UPDATE services SET service_name=? WHERE id=?", (text, state["service_id"]))
                     conn.commit()
                     conn.close()
-                    send(chat_id, f"✅ Название услуги изменено на: {text}")
+                    send(chat_id, f"✅ Название изменено на: {text}")
                     del editing_states[user_id]
                     continue
-
                 if state.get("step") == "edit_duration":
                     if text.isdigit():
                         conn = sqlite3.connect("saas.db")
@@ -1061,12 +1155,11 @@ while True:
                         cur.execute("UPDATE services SET duration=? WHERE id=?", (int(text), state["service_id"]))
                         conn.commit()
                         conn.close()
-                        send(chat_id, f"✅ Длительность изменена на: {text} минут")
+                        send(chat_id, f"✅ Длительность: {text} мин")
                         del editing_states[user_id]
                     else:
                         send(chat_id, "❌ Введите число")
                     continue
-
                 if state.get("step") == "edit_price":
                     if text.isdigit():
                         conn = sqlite3.connect("saas.db")
@@ -1074,16 +1167,15 @@ while True:
                         cur.execute("UPDATE services SET price=? WHERE id=?", (int(text), state["service_id"]))
                         conn.commit()
                         conn.close()
-                        send(chat_id, f"✅ Цена изменена на: {text} руб.")
+                        send(chat_id, f"✅ Цена: {text} руб")
                         del editing_states[user_id]
                     else:
                         send(chat_id, "❌ Введите число")
                     continue
 
-            # Обработка состояний клиента
+            # Клиентские состояния
             if user_id in client_states:
                 state = client_states[user_id]
-
                 if state.get("step") == "select_business":
                     if text.isdigit():
                         idx = int(text) - 1
@@ -1092,22 +1184,20 @@ while True:
                             state["business_id"] = biz[0]
                             state["business_name"] = biz[1]
                             state["step"] = "name"
-                            send(chat_id, f"✅ Вы выбрали {biz[1]}\n\nВведите ваше имя:")
+                            send(chat_id, f"✅ {biz[1]}\nВведите ваше имя:")
                         else:
-                            send(chat_id, f"❌ Введите число от 1 до {len(state['businesses'])}")
+                            send(chat_id, f"❌ Введите 1-{len(state['businesses'])}")
                     else:
-                        send(chat_id, "❌ Введите номер барбершопа")
+                        send(chat_id, "❌ Введите номер")
                     continue
-
                 if state.get("step") == "name":
                     if text.strip():
                         state["client_name"] = text.strip()
                         state["step"] = "phone"
-                        send(chat_id, "Введите ваш номер телефона:")
+                        send(chat_id, "Введите телефон:")
                     else:
                         send(chat_id, "❌ Имя не может быть пустым")
                     continue
-
                 if state.get("step") == "phone":
                     if text.strip():
                         state["client_phone"] = text.strip()
@@ -1117,45 +1207,42 @@ while True:
                         services = cur.fetchall()
                         conn.close()
                         if not services:
-                            send(chat_id, "❌ В этом барбершопе пока нет услуг")
+                            send(chat_id, "❌ Нет услуг")
                             del client_states[user_id]
                             continue
                         state["services"] = services
                         state["step"] = "service"
-                        msg = "📋 Выберите услугу:\n\n"
+                        msg = "📋 Услуги:\n\n"
                         for i, s in enumerate(services, 1):
                             msg += f"{i}. {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
-                        msg += "\nВведите номер услуги:"
+                        msg += "\nВведите номер:"
                         send(chat_id, msg)
                     else:
                         send(chat_id, "❌ Телефон не может быть пустым")
                     continue
-
                 if state.get("step") == "service":
                     if text.isdigit():
                         idx = int(text) - 1
                         if 0 <= idx < len(state["services"]):
                             state["service_name"] = state["services"][idx][1]
                             state["step"] = "date"
-                            send(chat_id, "Введите дату в формате ГГГГ-ММ-ДД:\nПример: 2024-12-31")
+                            send(chat_id, "Введите дату (ГГГГ-ММ-ДД):\nПример: 2024-12-31")
                         else:
-                            send(chat_id, f"❌ Введите число от 1 до {len(state['services'])}")
+                            send(chat_id, f"❌ Введите 1-{len(state['services'])}")
                     else:
-                        send(chat_id, "❌ Введите номер услуги")
+                        send(chat_id, "❌ Введите номер")
                     continue
-
                 if state.get("step") == "date":
                     if re.match(r'^\d{4}-\d{2}-\d{2}$', text):
                         if datetime.strptime(text, "%Y-%m-%d") < datetime.now().replace(hour=0, minute=0, second=0):
-                            send(chat_id, "❌ Нельзя записаться на прошедшую дату.")
+                            send(chat_id, "❌ Нельзя записаться в прошлое")
                             continue
                         state["booking_date"] = text
                         state["step"] = "time"
-                        send(chat_id, "Введите время в формате ЧЧ:ММ:\nПример: 14:30")
+                        send(chat_id, "Введите время (ЧЧ:ММ):\nПример: 14:30")
                     else:
-                        send(chat_id, "❌ Неверный формат. Используйте ГГГГ-ММ-ДД")
+                        send(chat_id, "❌ Формат ГГГГ-ММ-ДД")
                     continue
-
                 if state.get("step") == "time":
                     if re.match(r'^\d{2}:\d{2}$', text):
                         is_valid, error_msg = is_valid_booking_time(state["business_id"], state["booking_date"], text)
@@ -1172,7 +1259,7 @@ while True:
                             cur.execute("SELECT owner_id FROM businesses WHERE id=?", (state["business_id"],))
                             admin_id = cur.fetchone()[0]
                             conn.close()
-                            send(chat_id, f"✅ Вы успешно записаны!\n\n👤 Имя: {state['client_name']}\n📞 Телефон: {state['client_phone']}\n✂️ Барбершоп: {state['business_name']}\n💇 Услуга: {state['service_name']}\n📅 Дата: {state['booking_date']}\n⏰ Время: {state['booking_time']}\n\nСтатус: ожидает подтверждения")
+                            send(chat_id, f"✅ Записаны!\n👤 {state['client_name']}\n📞 {state['client_phone']}\n✂️ {state['business_name']}\n💇 {state['service_name']}\n📅 {state['booking_date']} {state['booking_time']}\n\n⏳ Ожидает подтверждения")
                             booking_info = {'booking_id': booking_id, 'client_name': state['client_name'], 'client_phone': state['client_phone'], 'service_name': state['service_name'], 'booking_date': state['booking_date'], 'booking_time': state['booking_time']}
                             send_admin_notification(admin_id, booking_info)
                             del client_states[user_id]
@@ -1180,7 +1267,7 @@ while True:
                             send(chat_id, f"❌ Ошибка: {e}")
                             del client_states[user_id]
                     else:
-                        send(chat_id, "❌ Неверный формат. Используйте ЧЧ:ММ")
+                        send(chat_id, "❌ Формат ЧЧ:ММ")
                     continue
 
     except Exception as e:
