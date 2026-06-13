@@ -8,6 +8,15 @@ import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+# ===== ОТКЛЮЧАЕМ ПРОКСИ =====
+# Удаляем все переменные прокси из окружения
+for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy']:
+    os.environ.pop(var, None)
+
+# Принудительно отключаем прокси в requests
+os.environ['NO_PROXY'] = '*'
+# ============================
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -60,7 +69,9 @@ CREATE TABLE IF NOT EXISTS businesses(
 cur.execute("""
 CREATE TABLE IF NOT EXISTS admins(
     user_id INTEGER PRIMARY KEY,
-    business_id INTEGER
+    business_id INTEGER,
+    added_by INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
@@ -132,6 +143,14 @@ try:
     cur.execute("ALTER TABLE businesses ADD COLUMN working_end INTEGER DEFAULT 21")
 except sqlite3.OperationalError:
     pass
+try:
+    cur.execute("ALTER TABLE admins ADD COLUMN added_by INTEGER")
+except sqlite3.OperationalError:
+    pass
+try:
+    cur.execute("ALTER TABLE admins ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+except sqlite3.OperationalError:
+    pass
 
 conn.commit()
 conn.close()
@@ -139,7 +158,7 @@ conn.close()
 
 def send(chat_id, text):
     try:
-        requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": chat_id, "text": text})
+        requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": chat_id, "text": text}, proxies={})
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
@@ -148,7 +167,8 @@ def send_inline_keyboard(chat_id, text, buttons):
     reply_markup = {"inline_keyboard": buttons}
     try:
         requests.post(f"{BASE_URL}/sendMessage",
-                      data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)})
+                      data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)},
+                      proxies={})
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
@@ -173,9 +193,6 @@ def send_admin_notification(admin_id, booking_info):
 def check_reminders():
     while True:
         try:
-            now = datetime.now()
-            one_hour_later = now + timedelta(hours=1)
-
             conn = sqlite3.connect("saas.db")
             cur = conn.cursor()
 
@@ -374,7 +391,7 @@ def create_payment_link(user_id, business_id, amount_rub, plan, days):
             "expires_in": 3600
         }
 
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, proxies={})
         result = response.json()
 
         if result.get("ok"):
@@ -396,7 +413,7 @@ def check_payment_status(payload):
         }
         params = {"payload": payload}
 
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, proxies={})
         result = response.json()
 
         if result.get("ok") and result.get("result"):
@@ -464,7 +481,7 @@ print(f"Пробный период: {TRIAL_DAYS} дней")
 
 while True:
     try:
-        response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10})
+        response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10}, proxies={})
         data = response.json()
 
         for update in data.get("result", []):
@@ -476,7 +493,7 @@ while True:
                 user_id = callback["from"]["id"]
                 data_callback = callback["data"]
 
-                requests.post(f"{BASE_URL}/answerCallbackQuery", data={"callback_query_id": callback["id"]})
+                requests.post(f"{BASE_URL}/answerCallbackQuery", data={"callback_query_id": callback["id"]}, proxies={})
 
                 if data_callback.startswith("confirm_"):
                     booking_id = int(data_callback.split("_")[1])
@@ -560,8 +577,7 @@ while True:
                         total = 0
                         total_sum = 0
                         for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[
-                                                                                                         2] == "pending" else "отменены"
+                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
                             msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
                             total += stat[0] if stat[0] else 0
                             total_sum += stat[1] if stat[1] else 0
@@ -576,8 +592,7 @@ while True:
                         total = 0
                         total_sum = 0
                         for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[
-                                                                                                         2] == "pending" else "отменены"
+                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
                             msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
                             total += stat[0] if stat[0] else 0
                             total_sum += stat[1] if stat[1] else 0
@@ -592,8 +607,7 @@ while True:
                         total = 0
                         total_sum = 0
                         for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[
-                                                                                                         2] == "pending" else "отменены"
+                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
                             msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
                             total += stat[0] if stat[0] else 0
                             total_sum += stat[1] if stat[1] else 0
@@ -707,6 +721,34 @@ while True:
 
             print(f"Сообщение от {user_id}: {text}")
 
+            # ADD ADMIN - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+            if text == "/addadmin" and user_id == MASTER_ADMIN_ID:
+                users[user_id] = {"step": "add_admin"}
+                send(chat_id, "✉️ Введите Telegram ID пользователя, которого хотите сделать администратором.\n\nℹ️ Чтобы узнать ID, попросите его отправить команду /id.")
+                continue
+
+            # ADMINS - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+            if text == "/admins" and user_id == MASTER_ADMIN_ID:
+                conn = sqlite3.connect("saas.db")
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT user_id, business_id, added_by, created_at 
+                    FROM admins 
+                    ORDER BY created_at DESC
+                """)
+                admins_list = cur.fetchall()
+                conn.close()
+                
+                if not admins_list:
+                    send(chat_id, "👥 Список администраторов пуст.")
+                else:
+                    msg = "👥 **Список администраторов:**\n\n"
+                    for admin in admins_list:
+                        added_by = "главный админ" if admin[2] == MASTER_ADMIN_ID else f"администратором {admin[2]}"
+                        msg += f"🆔 `{admin[0]}`\n   📍 Бизнес ID: {admin[1]}\n   👤 Добавлен: {added_by}\n   📅 {admin[3]}\n\n"
+                    send(chat_id, msg)
+                continue
+
             if text == "/cancel_booking":
                 conn = sqlite3.connect("saas.db")
                 cur = conn.cursor()
@@ -780,8 +822,19 @@ while True:
                 continue
 
             if text == "/workhours" and is_admin(user_id):
-                editing_states[user_id] = {"step": "edit_start"}
-                send(chat_id, "Введите время начала работы (в часах от 0 до 23):\nПример: 9")
+                business = get_admin_business(user_id)
+                if business:
+                    conn = sqlite3.connect("saas.db")
+                    cur = conn.cursor()
+                    cur.execute("SELECT working_start, working_end FROM businesses WHERE id=?", (business[0],))
+                    hours = cur.fetchone()
+                    conn.close()
+                    if hours:
+                        send(chat_id, f"⏰ Текущие часы работы: {hours[0]}:00 - {hours[1]}:00\n\nЧтобы изменить, отправь новое время в формате: 09:00-21:00")
+                    else:
+                        send(chat_id, "❌ Часы работы не установлены.")
+                else:
+                    send(chat_id, "❌ Сначала зарегистрируйте бизнес через /register")
                 continue
 
             if text == "/start":
@@ -827,6 +880,11 @@ while True:
                     menu += "/workhours - часы работы\n"
                     menu += "/getlink - получить ссылку\n"
                     menu += "/subscription - управление подпиской"
+
+                    if user_id == MASTER_ADMIN_ID:
+                        menu += "\n\n👑 Команды главного админа:\n"
+                        menu += "/addadmin - добавить администратора\n"
+                        menu += "/admins - список администраторов"
 
                     if "истекла" in status or "нет подписки" in status:
                         buttons = [[{"text": "💳 Купить подписку", "callback_data": "buy_subscription"}]]
@@ -971,6 +1029,35 @@ while True:
                         send(chat_id, "❌ Ошибка: не удалось получить ссылку")
                 continue
 
+            # Обработка добавления администратора (только для главного админа)
+            if user_id == MASTER_ADMIN_ID and user_id in users and users[user_id].get("step") == "add_admin":
+                try:
+                    new_admin_id = int(text)
+                    
+                    # Проверяем, есть ли у этого пользователя бизнес
+                    business = get_admin_business(new_admin_id)
+                    if not business:
+                        send(chat_id, f"❌ Пользователь `{new_admin_id}` не зарегистрировал барбершоп. Сначала попросите его пройти регистрацию через /register")
+                        del users[user_id]
+                        continue
+                    
+                    conn = sqlite3.connect("saas.db")
+                    cur = conn.cursor()
+                    cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?, ?, ?)", 
+                                (new_admin_id, business[0], user_id))
+                    conn.commit()
+                    conn.close()
+                    
+                    send(chat_id, f"✅ Пользователь `{new_admin_id}` добавлен как администратор.")
+                    send(new_admin_id, f"🎉 Вас добавили как администратора бота! Используйте /start для входа в админ-панель.")
+                    del users[user_id]
+                except ValueError:
+                    send(chat_id, "❌ Неверный формат ID. Введите только цифры.")
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка: {e}")
+                    del users[user_id]
+                continue
+
             if user_id in editing_states and editing_states[user_id].get("step") == "edit_start":
                 if text.isdigit():
                     hour = int(text)
@@ -1074,8 +1161,8 @@ while True:
                         """, (user_id, state["business_name"], slug, state["address"], text, trial_end))
 
                         business_id = cur.lastrowid
-                        cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id) VALUES (?,?)",
-                                    (user_id, business_id))
+                        cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?,?,?)",
+                                    (user_id, business_id, MASTER_ADMIN_ID))
 
                         conn.commit()
                         conn.close()
@@ -1264,3 +1351,4 @@ while True:
 
     except Exception as e:
         print(f"Ошибка в основном цикле: {e}")
+
