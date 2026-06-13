@@ -2,33 +2,26 @@ import os
 import sqlite3
 import requests
 import re
-import time
 import json
 import threading
 from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-
-# ===== ОТКЛЮЧАЕМ ПРОКСИ =====
-# Удаляем все переменные прокси из окружения
-for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy']:
-    os.environ.pop(var, None)
-
-# Принудительно отключаем прокси в requests
-os.environ['NO_PROXY'] = '*'
-# ============================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-offset = 0
+CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN")
+MASTER_ADMIN_ID = 1897413803
+BOT_USERNAME = "LeadFlowHQ_bot"
+
+# Flask приложение
+app = Flask(__name__)
+
 users = {}
 client_states = {}
 editing_states = {}
-
-MASTER_ADMIN_ID = 1897413803
-BOT_USERNAME = "LeadFlowHQ_bot"
-CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN")
 
 PRICES = {
     "month": 490,
@@ -158,7 +151,7 @@ conn.close()
 
 def send(chat_id, text):
     try:
-        requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": chat_id, "text": text}, proxies={})
+        requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": chat_id, "text": text})
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
@@ -167,8 +160,7 @@ def send_inline_keyboard(chat_id, text, buttons):
     reply_markup = {"inline_keyboard": buttons}
     try:
         requests.post(f"{BASE_URL}/sendMessage",
-                      data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)},
-                      proxies={})
+                      data={"chat_id": chat_id, "text": text, "reply_markup": json.dumps(reply_markup)})
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
@@ -188,83 +180,6 @@ def send_admin_notification(admin_id, booking_info):
         [{"text": "❌ Отменить", "callback_data": f"reject_{booking_info['booking_id']}"}]
     ]
     send_inline_keyboard(admin_id, msg, buttons)
-
-
-def check_reminders():
-    while True:
-        try:
-            conn = sqlite3.connect("saas.db")
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT id, client_id, client_name, service_name, booking_date, booking_time
-                FROM bookings 
-                WHERE status = 'confirmed' 
-                AND (reminder_sent IS NULL OR reminder_sent = 0)
-                AND datetime(booking_date || ' ' || booking_time) BETWEEN datetime('now') AND datetime('now', '+1 hour')
-            """)
-
-            reminders = cur.fetchall()
-
-            for reminder in reminders:
-                if reminder[1]:
-                    send(reminder[1],
-                         f"🔔 Напоминание!\n\nУ вас запись через час:\n💇 {reminder[3]}\n📅 {reminder[4]} {reminder[5]}")
-                cur.execute("UPDATE bookings SET reminder_sent=1 WHERE id=?", (reminder[0],))
-                conn.commit()
-
-            conn.close()
-        except Exception as e:
-            print(f"Ошибка проверки напоминаний: {e}")
-
-        time.sleep(60)
-
-
-def check_subscription_expiry():
-    while True:
-        try:
-            now = datetime.now()
-            three_days_later = now + timedelta(days=3)
-
-            conn = sqlite3.connect("saas.db")
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT owner_id, business_name, subscription_end 
-                FROM businesses 
-                WHERE subscription_end <= ? 
-                AND subscription_end > ?
-                AND (notification_sent_3d IS NULL OR notification_sent_3d = 0)
-            """, (three_days_later.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")))
-
-            expiring = cur.fetchall()
-
-            for business in expiring:
-                send(business[0],
-                     f"⚠️ Ваша подписка истекает через 3 дня!\n\nБизнес: {business[1]}\nДата окончания: {business[2]}\n\nДля продления используйте /subscription")
-                cur.execute("UPDATE businesses SET notification_sent_3d=1 WHERE owner_id=?", (business[0],))
-                conn.commit()
-
-            cur.execute("""
-                SELECT owner_id, business_name, subscription_end 
-                FROM businesses 
-                WHERE subscription_end < ?
-                AND (expired_notification_sent IS NULL OR expired_notification_sent = 0)
-            """, (now.strftime("%Y-%m-%d"),))
-
-            expired = cur.fetchall()
-
-            for business in expired:
-                send(business[0],
-                     f"❌ Ваша подписка истекла!\n\nБизнес: {business[1]}\nДата окончания: {business[2]}\n\nДля продления используйте /subscription")
-                cur.execute("UPDATE businesses SET expired_notification_sent=1 WHERE owner_id=?", (business[0],))
-                conn.commit()
-
-            conn.close()
-        except Exception as e:
-            print(f"Ошибка проверки подписок: {e}")
-
-        time.sleep(3600)
 
 
 def is_admin(user_id):
@@ -391,7 +306,7 @@ def create_payment_link(user_id, business_id, amount_rub, plan, days):
             "expires_in": 3600
         }
 
-        response = requests.post(url, headers=headers, json=data, proxies={})
+        response = requests.post(url, headers=headers, json=data)
         result = response.json()
 
         if result.get("ok"):
@@ -413,7 +328,7 @@ def check_payment_status(payload):
         }
         params = {"payload": payload}
 
-        response = requests.get(url, headers=headers, params=params, proxies={})
+        response = requests.get(url, headers=headers, params=params)
         result = response.json()
 
         if result.get("ok") and result.get("result"):
@@ -470,885 +385,905 @@ def generate_unique_slug(business_name, user_id):
     return slug
 
 
-reminder_thread = threading.Thread(target=check_reminders, daemon=True)
-reminder_thread.start()
+def process_update(update):
+    """Обрабатывает одно обновление от Telegram"""
+    if "callback_query" in update:
+        callback = update["callback_query"]
+        chat_id = callback["message"]["chat"]["id"]
+        user_id = callback["from"]["id"]
+        data_callback = callback["data"]
 
-subscription_thread = threading.Thread(target=check_subscription_expiry, daemon=True)
-subscription_thread.start()
+        requests.post(f"{BASE_URL}/answerCallbackQuery", data={"callback_query_id": callback["id"]})
 
-print(f"Бот запущен")
-print(f"Пробный период: {TRIAL_DAYS} дней")
+        if data_callback.startswith("confirm_"):
+            booking_id = int(data_callback.split("_")[1])
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("UPDATE bookings SET status='confirmed' WHERE id=?", (booking_id,))
+            conn.commit()
+            cur.execute("SELECT client_id FROM bookings WHERE id=?", (booking_id,))
+            row = cur.fetchone()
+            conn.close()
+            send(chat_id, f"✅ Запись #{booking_id} подтверждена!")
+            if row and row[0]:
+                send(row[0], f"✅ Ваша запись подтверждена! Ждем вас.")
 
-while True:
-    try:
-        response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10}, proxies={})
-        data = response.json()
+        elif data_callback.startswith("reject_"):
+            booking_id = int(data_callback.split("_")[1])
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("UPDATE bookings SET status='rejected' WHERE id=?", (booking_id,))
+            conn.commit()
+            cur.execute("SELECT client_id FROM bookings WHERE id=?", (booking_id,))
+            row = cur.fetchone()
+            conn.close()
+            send(chat_id, f"❌ Запись #{booking_id} отменена!")
+            if row and row[0]:
+                send(row[0], f"❌ Ваша запись отменена. Пожалуйста, свяжитесь с барбершопом.")
 
-        for update in data.get("result", []):
-            offset = update["update_id"] + 1
+        elif data_callback.startswith("cancel_"):
+            booking_id = int(data_callback.split("_")[1])
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
+            conn.commit()
+            conn.close()
+            send(chat_id, f"✅ Запись #{booking_id} отменена!")
 
-            if "callback_query" in update:
-                callback = update["callback_query"]
-                chat_id = callback["message"]["chat"]["id"]
-                user_id = callback["from"]["id"]
-                data_callback = callback["data"]
+        elif data_callback.startswith("edit_service_"):
+            service_id = int(data_callback.split("_")[2])
+            editing_states[user_id] = {"step": "edit_field", "service_id": service_id}
+            buttons = [
+                [{"text": "Изменить название", "callback_data": f"edit_name_{service_id}"}],
+                [{"text": "Изменить длительность", "callback_data": f"edit_duration_{service_id}"}],
+                [{"text": "Изменить цену", "callback_data": f"edit_price_{service_id}"}],
+                [{"text": "Назад", "callback_data": "back_to_services"}]
+            ]
+            send_inline_keyboard(chat_id, "Что хотите изменить?", buttons)
 
-                requests.post(f"{BASE_URL}/answerCallbackQuery", data={"callback_query_id": callback["id"]}, proxies={})
+        elif data_callback.startswith("edit_name_"):
+            service_id = int(data_callback.split("_")[2])
+            editing_states[user_id] = {"step": "edit_name", "service_id": service_id}
+            send(chat_id, "Введите новое название услуги:")
 
-                if data_callback.startswith("confirm_"):
-                    booking_id = int(data_callback.split("_")[1])
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bookings SET status='confirmed' WHERE id=?", (booking_id,))
-                    conn.commit()
-                    cur.execute("SELECT client_id FROM bookings WHERE id=?", (booking_id,))
-                    row = cur.fetchone()
-                    conn.close()
-                    send(chat_id, f"✅ Запись #{booking_id} подтверждена!")
-                    if row and row[0]:
-                        send(row[0], f"✅ Ваша запись подтверждена! Ждем вас.")
+        elif data_callback.startswith("edit_duration_"):
+            service_id = int(data_callback.split("_")[2])
+            editing_states[user_id] = {"step": "edit_duration", "service_id": service_id}
+            send(chat_id, "Введите новую длительность в минутах:")
 
-                elif data_callback.startswith("reject_"):
-                    booking_id = int(data_callback.split("_")[1])
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bookings SET status='rejected' WHERE id=?", (booking_id,))
-                    conn.commit()
-                    cur.execute("SELECT client_id FROM bookings WHERE id=?", (booking_id,))
-                    row = cur.fetchone()
-                    conn.close()
-                    send(chat_id, f"❌ Запись #{booking_id} отменена!")
-                    if row and row[0]:
-                        send(row[0], f"❌ Ваша запись отменена. Пожалуйста, свяжитесь с барбершопом.")
+        elif data_callback.startswith("edit_price_"):
+            service_id = int(data_callback.split("_")[2])
+            editing_states[user_id] = {"step": "edit_price", "service_id": service_id}
+            send(chat_id, "Введите новую цену в рублях:")
 
-                elif data_callback.startswith("cancel_"):
-                    booking_id = int(data_callback.split("_")[1])
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
-                    conn.commit()
-                    conn.close()
-                    send(chat_id, f"✅ Запись #{booking_id} отменена!")
+        elif data_callback.startswith("delete_service_"):
+            service_id = int(data_callback.split("_")[2])
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("DELETE FROM services WHERE id=?", (service_id,))
+            conn.commit()
+            conn.close()
+            send(chat_id, f"✅ Услуга удалена!")
 
-                elif data_callback.startswith("edit_service_"):
-                    service_id = int(data_callback.split("_")[2])
-                    editing_states[user_id] = {"step": "edit_field", "service_id": service_id}
-                    buttons = [
-                        [{"text": "Изменить название", "callback_data": f"edit_name_{service_id}"}],
-                        [{"text": "Изменить длительность", "callback_data": f"edit_duration_{service_id}"}],
-                        [{"text": "Изменить цену", "callback_data": f"edit_price_{service_id}"}],
-                        [{"text": "Назад", "callback_data": "back_to_services"}]
-                    ]
-                    send_inline_keyboard(chat_id, "Что хотите изменить?", buttons)
+        elif data_callback == "edit_work_hours":
+            editing_states[user_id] = {"step": "edit_start"}
+            send(chat_id, "Введите время начала работы (в часах от 0 до 23):\nПример: 9")
 
-                elif data_callback.startswith("edit_name_"):
-                    service_id = int(data_callback.split("_")[2])
-                    editing_states[user_id] = {"step": "edit_name", "service_id": service_id}
-                    send(chat_id, "Введите новое название услуги:")
+        elif data_callback == "stats_day":
+            business = get_admin_business(user_id)
+            if business:
+                stats = get_booking_stats(business[0], "day")
+                msg = f"📊 Статистика за сегодня:\n\n"
+                total = 0
+                total_sum = 0
+                for stat in stats:
+                    status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
+                    msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
+                    total += stat[0] if stat[0] else 0
+                    total_sum += stat[1] if stat[1] else 0
+                msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
+                send(chat_id, msg)
 
-                elif data_callback.startswith("edit_duration_"):
-                    service_id = int(data_callback.split("_")[2])
-                    editing_states[user_id] = {"step": "edit_duration", "service_id": service_id}
-                    send(chat_id, "Введите новую длительность в минутах:")
+        elif data_callback == "stats_week":
+            business = get_admin_business(user_id)
+            if business:
+                stats = get_booking_stats(business[0], "week")
+                msg = f"📊 Статистика за неделю:\n\n"
+                total = 0
+                total_sum = 0
+                for stat in stats:
+                    status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
+                    msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
+                    total += stat[0] if stat[0] else 0
+                    total_sum += stat[1] if stat[1] else 0
+                msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
+                send(chat_id, msg)
 
-                elif data_callback.startswith("edit_price_"):
-                    service_id = int(data_callback.split("_")[2])
-                    editing_states[user_id] = {"step": "edit_price", "service_id": service_id}
-                    send(chat_id, "Введите новую цену в рублях:")
+        elif data_callback == "stats_month":
+            business = get_admin_business(user_id)
+            if business:
+                stats = get_booking_stats(business[0], "month")
+                msg = f"📊 Статистика за месяц:\n\n"
+                total = 0
+                total_sum = 0
+                for stat in stats:
+                    status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
+                    msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
+                    total += stat[0] if stat[0] else 0
+                    total_sum += stat[1] if stat[1] else 0
+                msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
+                send(chat_id, msg)
 
-                elif data_callback.startswith("delete_service_"):
-                    service_id = int(data_callback.split("_")[2])
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM services WHERE id=?", (service_id,))
-                    conn.commit()
-                    conn.close()
-                    send(chat_id, f"✅ Услуга удалена!")
-
-                elif data_callback == "edit_work_hours":
-                    editing_states[user_id] = {"step": "edit_start"}
-                    send(chat_id, "Введите время начала работы (в часах от 0 до 23):\nПример: 9")
-
-                elif data_callback == "stats_day":
-                    business = get_admin_business(user_id)
-                    if business:
-                        stats = get_booking_stats(business[0], "day")
-                        msg = f"📊 Статистика за сегодня:\n\n"
-                        total = 0
-                        total_sum = 0
-                        for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
-                            msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
-                            total += stat[0] if stat[0] else 0
-                            total_sum += stat[1] if stat[1] else 0
-                        msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
-                        send(chat_id, msg)
-
-                elif data_callback == "stats_week":
-                    business = get_admin_business(user_id)
-                    if business:
-                        stats = get_booking_stats(business[0], "week")
-                        msg = f"📊 Статистика за неделю:\n\n"
-                        total = 0
-                        total_sum = 0
-                        for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
-                            msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
-                            total += stat[0] if stat[0] else 0
-                            total_sum += stat[1] if stat[1] else 0
-                        msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
-                        send(chat_id, msg)
-
-                elif data_callback == "stats_month":
-                    business = get_admin_business(user_id)
-                    if business:
-                        stats = get_booking_stats(business[0], "month")
-                        msg = f"📊 Статистика за месяц:\n\n"
-                        total = 0
-                        total_sum = 0
-                        for stat in stats:
-                            status_name = "подтверждены" if stat[2] == "confirmed" else "ожидают" if stat[2] == "pending" else "отменены"
-                            msg += f"{status_name}: {stat[0]} шт., {stat[1] if stat[1] else 0} руб.\n"
-                            total += stat[0] if stat[0] else 0
-                            total_sum += stat[1] if stat[1] else 0
-                        msg += f"\nВсего записей: {total}\nОбщая сумма: {total_sum} руб."
-                        send(chat_id, msg)
-
-                elif data_callback == "back_to_services":
-                    business = get_admin_business(user_id)
-                    if business:
-                        conn = sqlite3.connect("saas.db")
-                        cur = conn.cursor()
-                        cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
-                                    (business[0],))
-                        services = cur.fetchall()
-                        conn.close()
-                        if services:
-                            msg = "📋 Ваши услуги:\n\n"
-                            for s in services:
-                                msg += f"✂️ {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
-                            buttons = []
-                            for s in services:
-                                buttons.append([{"text": f"✏️ {s[1]}", "callback_data": f"edit_service_{s[0]}"}])
-                                buttons.append(
-                                    [{"text": f"🗑 Удалить {s[1]}", "callback_data": f"delete_service_{s[0]}"}])
-                            buttons.append([{"text": "📊 Статистика", "callback_data": "stats_menu"}])
-                            buttons.append([{"text": "⏰ Часы работы", "callback_data": "edit_work_hours"}])
-                            send_inline_keyboard(chat_id, msg, buttons)
-                        else:
-                            send(chat_id, "У вас нет услуг. Добавьте через /addservice")
-
-                elif data_callback == "stats_menu":
-                    buttons = [
-                        [{"text": "За сегодня", "callback_data": "stats_day"}],
-                        [{"text": "За неделю", "callback_data": "stats_week"}],
-                        [{"text": "За месяц", "callback_data": "stats_month"}],
-                        [{"text": "Назад", "callback_data": "back_to_services"}]
-                    ]
-                    send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
-
-                elif data_callback == "buy_subscription":
-                    buttons = [
-                        [{"text": f"💰 1 месяц — {PRICES['month']} ₽", "callback_data": "pay_month"}],
-                        [{"text": f"💰 3 месяца — {PRICES['3months']} ₽", "callback_data": "pay_3months"}],
-                        [{"text": f"💰 12 месяцев — {PRICES['year']} ₽", "callback_data": "pay_year"}]
-                    ]
-                    send_inline_keyboard(chat_id, "Выберите тариф:", buttons)
-
-                elif data_callback in ["pay_month", "pay_3months", "pay_year"]:
-                    if data_callback == "pay_month":
-                        amount = PRICES["month"]
-                        days = SUBSCRIPTION_DAYS["month"]
-                        plan = "month"
-                    elif data_callback == "pay_3months":
-                        amount = PRICES["3months"]
-                        days = SUBSCRIPTION_DAYS["3months"]
-                        plan = "3months"
-                    else:
-                        amount = PRICES["year"]
-                        days = SUBSCRIPTION_DAYS["year"]
-                        plan = "year"
-
-                    business = get_admin_business(user_id)
-                    if not business:
-                        send(chat_id, "❌ Сначала зарегистрируйте бизнес через /register")
-                        continue
-
-                    business_id = business[0]
-                    payment_url = create_payment_link(user_id, business_id, amount, plan, days)
-
-                    if payment_url:
-                        send(chat_id,
-                             f"💳 Оплата подписки\n\nСумма: {amount} ₽\nПериод: {days} дней\n\n🔗 [Нажмите для оплаты]({payment_url})\n\nСпособы оплаты:\n• Банковская карта\n• СБП\n• Криптовалюта\n\n✅ После оплаты нажмите «Проверить оплату»")
-                        buttons = [[{"text": "🔄 Проверить оплату",
-                                     "callback_data": f"check_payment_{business_id}_{plan}_{user_id}"}]]
-                        send_inline_keyboard(chat_id, "Ожидаем оплату...", buttons)
-                    else:
-                        send(chat_id, "❌ Ошибка при создании платежа.")
-
-                elif data_callback.startswith("check_payment_"):
-                    parts = data_callback.split("_")
-                    business_id = int(parts[2])
-                    plan = parts[3]
-                    admin_user_id = int(parts[4])
-
-                    send(chat_id, "⏳ Проверяем статус платежа...")
-                    payload = f"user_{admin_user_id}_business_{business_id}_plan_{plan}"
-                    paid, invoice = check_payment_status(payload)
-
-                    if paid:
-                        if plan == "month":
-                            days = SUBSCRIPTION_DAYS["month"]
-                        elif plan == "3months":
-                            days = SUBSCRIPTION_DAYS["3months"]
-                        else:
-                            days = SUBSCRIPTION_DAYS["year"]
-
-                        new_end = activate_subscription(business_id, days)
-                        send(chat_id, f"✅ Подписка успешно активирована!\n\n📅 Действует до: {new_end}")
-                    else:
-                        send(chat_id, "⏳ Платёж ещё не подтверждён.\n\nЕсли вы уже оплатили, подождите 1-2 минуты.")
-
-                continue
-
-            if "message" not in update:
-                continue
-
-            message = update["message"]
-            chat_id = message["chat"]["id"]
-            user_id = message["from"]["id"]
-            text = message.get("text", "")
-
-            print(f"Сообщение от {user_id}: {text}")
-
-            # ADD ADMIN - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
-            if text == "/addadmin" and user_id == MASTER_ADMIN_ID:
-                users[user_id] = {"step": "add_admin"}
-                send(chat_id, "✉️ Введите Telegram ID пользователя, которого хотите сделать администратором.\n\nℹ️ Чтобы узнать ID, попросите его отправить команду /id.")
-                continue
-
-            # ADMINS - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
-            if text == "/admins" and user_id == MASTER_ADMIN_ID:
+        elif data_callback == "back_to_services":
+            business = get_admin_business(user_id)
+            if business:
                 conn = sqlite3.connect("saas.db")
                 cur = conn.cursor()
-                cur.execute("""
-                    SELECT user_id, business_id, added_by, created_at 
-                    FROM admins 
-                    ORDER BY created_at DESC
-                """)
-                admins_list = cur.fetchall()
+                cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
+                            (business[0],))
+                services = cur.fetchall()
                 conn.close()
-                
-                if not admins_list:
-                    send(chat_id, "👥 Список администраторов пуст.")
+                if services:
+                    msg = "📋 Ваши услуги:\n\n"
+                    for s in services:
+                        msg += f"✂️ {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
+                    buttons = []
+                    for s in services:
+                        buttons.append([{"text": f"✏️ {s[1]}", "callback_data": f"edit_service_{s[0]}"}])
+                        buttons.append(
+                            [{"text": f"🗑 Удалить {s[1]}", "callback_data": f"delete_service_{s[0]}"}])
+                    buttons.append([{"text": "📊 Статистика", "callback_data": "stats_menu"}])
+                    buttons.append([{"text": "⏰ Часы работы", "callback_data": "edit_work_hours"}])
+                    send_inline_keyboard(chat_id, msg, buttons)
                 else:
-                    msg = "👥 **Список администраторов:**\n\n"
-                    for admin in admins_list:
-                        added_by = "главный админ" if admin[2] == MASTER_ADMIN_ID else f"администратором {admin[2]}"
-                        msg += f"🆔 `{admin[0]}`\n   📍 Бизнес ID: {admin[1]}\n   👤 Добавлен: {added_by}\n   📅 {admin[3]}\n\n"
-                    send(chat_id, msg)
-                continue
+                    send(chat_id, "У вас нет услуг. Добавьте через /addservice")
 
-            if text == "/cancel_booking":
-                conn = sqlite3.connect("saas.db")
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT id, service_name, booking_date, booking_time, status FROM bookings WHERE client_id=? AND status='pending'",
-                    (user_id,))
-                bookings = cur.fetchall()
-                conn.close()
+        elif data_callback == "stats_menu":
+            buttons = [
+                [{"text": "За сегодня", "callback_data": "stats_day"}],
+                [{"text": "За неделю", "callback_data": "stats_week"}],
+                [{"text": "За месяц", "callback_data": "stats_month"}],
+                [{"text": "Назад", "callback_data": "back_to_services"}]
+            ]
+            send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
 
-                if not bookings:
-                    send(chat_id, "❌ У вас нет активных записей для отмены.")
-                    continue
+        elif data_callback == "buy_subscription":
+            buttons = [
+                [{"text": f"💰 1 месяц — {PRICES['month']} ₽", "callback_data": "pay_month"}],
+                [{"text": f"💰 3 месяца — {PRICES['3months']} ₽", "callback_data": "pay_3months"}],
+                [{"text": f"💰 12 месяцев — {PRICES['year']} ₽", "callback_data": "pay_year"}]
+            ]
+            send_inline_keyboard(chat_id, "Выберите тариф:", buttons)
 
-                msg = "Выберите запись для отмены:\n\n"
+        elif data_callback in ["pay_month", "pay_3months", "pay_year"]:
+            if data_callback == "pay_month":
+                amount = PRICES["month"]
+                days = SUBSCRIPTION_DAYS["month"]
+                plan = "month"
+            elif data_callback == "pay_3months":
+                amount = PRICES["3months"]
+                days = SUBSCRIPTION_DAYS["3months"]
+                plan = "3months"
+            else:
+                amount = PRICES["year"]
+                days = SUBSCRIPTION_DAYS["year"]
+                plan = "year"
+
+            business = get_admin_business(user_id)
+            if not business:
+                send(chat_id, "❌ Сначала зарегистрируйте бизнес через /register")
+                return
+
+            business_id = business[0]
+            payment_url = create_payment_link(user_id, business_id, amount, plan, days)
+
+            if payment_url:
+                send(chat_id,
+                     f"💳 Оплата подписки\n\nСумма: {amount} ₽\nПериод: {days} дней\n\n🔗 [Нажмите для оплаты]({payment_url})\n\nСпособы оплаты:\n• Банковская карта\n• СБП\n• Криптовалюта\n\n✅ После оплаты нажмите «Проверить оплату»")
+                buttons = [[{"text": "🔄 Проверить оплату",
+                             "callback_data": f"check_payment_{business_id}_{plan}_{user_id}"}]]
+                send_inline_keyboard(chat_id, "Ожидаем оплату...", buttons)
+            else:
+                send(chat_id, "❌ Ошибка при создании платежа.")
+
+        elif data_callback.startswith("check_payment_"):
+            parts = data_callback.split("_")
+            business_id = int(parts[2])
+            plan = parts[3]
+            admin_user_id = int(parts[4])
+
+            send(chat_id, "⏳ Проверяем статус платежа...")
+            payload = f"user_{admin_user_id}_business_{business_id}_plan_{plan}"
+            paid, invoice = check_payment_status(payload)
+
+            if paid:
+                if plan == "month":
+                    days = SUBSCRIPTION_DAYS["month"]
+                elif plan == "3months":
+                    days = SUBSCRIPTION_DAYS["3months"]
+                else:
+                    days = SUBSCRIPTION_DAYS["year"]
+
+                new_end = activate_subscription(business_id, days)
+                send(chat_id, f"✅ Подписка успешно активирована!\n\n📅 Действует до: {new_end}")
+            else:
+                send(chat_id, "⏳ Платёж ещё не подтверждён.\n\nЕсли вы уже оплатили, подождите 1-2 минуты.")
+
+        return
+
+    if "message" not in update:
+        return
+
+    message = update["message"]
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    text = message.get("text", "")
+
+    print(f"Сообщение от {user_id}: {text}")
+
+    # ADD ADMIN - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+    if text == "/addadmin" and user_id == MASTER_ADMIN_ID:
+        users[user_id] = {"step": "add_admin"}
+        send(chat_id, "✉️ Введите Telegram ID пользователя, которого хотите сделать администратором.\n\nℹ️ Чтобы узнать ID, попросите его отправить команду /id.")
+        return
+
+    # ADMINS - ТОЛЬКО ДЛЯ ГЛАВНОГО АДМИНА
+    if text == "/admins" and user_id == MASTER_ADMIN_ID:
+        conn = sqlite3.connect("saas.db")
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT user_id, business_id, added_by, created_at 
+            FROM admins 
+            ORDER BY created_at DESC
+        """)
+        admins_list = cur.fetchall()
+        conn.close()
+        
+        if not admins_list:
+            send(chat_id, "👥 Список администраторов пуст.")
+        else:
+            msg = "👥 **Список администраторов:**\n\n"
+            for admin in admins_list:
+                added_by = "главный админ" if admin[2] == MASTER_ADMIN_ID else f"администратором {admin[2]}"
+                msg += f"🆔 `{admin[0]}`\n   📍 Бизнес ID: {admin[1]}\n   👤 Добавлен: {added_by}\n   📅 {admin[3]}\n\n"
+            send(chat_id, msg)
+        return
+
+    if text == "/cancel_booking":
+        conn = sqlite3.connect("saas.db")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, service_name, booking_date, booking_time, status FROM bookings WHERE client_id=? AND status='pending'",
+            (user_id,))
+        bookings = cur.fetchall()
+        conn.close()
+
+        if not bookings:
+            send(chat_id, "❌ У вас нет активных записей для отмены.")
+            return
+
+        msg = "Выберите запись для отмены:\n\n"
+        buttons = []
+        for booking in bookings:
+            msg += f"🆔 {booking[0]}: {booking[1]} - {booking[2]} {booking[3]}\n"
+            buttons.append([{"text": f"Отменить #{booking[0]}", "callback_data": f"cancel_{booking[0]}"}])
+
+        buttons.append([{"text": "Назад", "callback_data": "back"}])
+        send_inline_keyboard(chat_id, msg, buttons)
+        return
+
+    if text == "/editservice" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
+                        (business[0],))
+            services = cur.fetchall()
+            conn.close()
+            if services:
+                msg = "Выберите услугу для редактирования:\n\n"
                 buttons = []
-                for booking in bookings:
-                    msg += f"🆔 {booking[0]}: {booking[1]} - {booking[2]} {booking[3]}\n"
-                    buttons.append([{"text": f"Отменить #{booking[0]}", "callback_data": f"cancel_{booking[0]}"}])
-
+                for s in services:
+                    msg += f"✂️ {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
+                    buttons.append([{"text": f"✏️ {s[1]}", "callback_data": f"edit_service_{s[0]}"}])
                 buttons.append([{"text": "Назад", "callback_data": "back"}])
                 send_inline_keyboard(chat_id, msg, buttons)
-                continue
+            else:
+                send(chat_id, "У вас нет услуг. Добавьте через /addservice")
+        return
 
-            if text == "/editservice" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
-                                (business[0],))
-                    services = cur.fetchall()
-                    conn.close()
-                    if services:
-                        msg = "Выберите услугу для редактирования:\n\n"
-                        buttons = []
-                        for s in services:
-                            msg += f"✂️ {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
-                            buttons.append([{"text": f"✏️ {s[1]}", "callback_data": f"edit_service_{s[0]}"}])
-                        buttons.append([{"text": "Назад", "callback_data": "back"}])
-                        send_inline_keyboard(chat_id, msg, buttons)
-                    else:
-                        send(chat_id, "У вас нет услуг. Добавьте через /addservice")
-                continue
-
-            if text == "/deleteservice" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT id, service_name FROM services WHERE business_id=?", (business[0],))
-                    services = cur.fetchall()
-                    conn.close()
-                    if services:
-                        msg = "Выберите услугу для удаления:\n\n"
-                        buttons = []
-                        for s in services:
-                            buttons.append([{"text": f"🗑 {s[1]}", "callback_data": f"delete_service_{s[0]}"}])
-                        buttons.append([{"text": "Назад", "callback_data": "back"}])
-                        send_inline_keyboard(chat_id, msg, buttons)
-                    else:
-                        send(chat_id, "У вас нет услуг для удаления.")
-                continue
-
-            if text == "/stats" and is_admin(user_id):
-                buttons = [
-                    [{"text": "За сегодня", "callback_data": "stats_day"}],
-                    [{"text": "За неделю", "callback_data": "stats_week"}],
-                    [{"text": "За месяц", "callback_data": "stats_month"}]
-                ]
-                send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
-                continue
-
-            if text == "/workhours" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT working_start, working_end FROM businesses WHERE id=?", (business[0],))
-                    hours = cur.fetchone()
-                    conn.close()
-                    if hours:
-                        send(chat_id, f"⏰ Текущие часы работы: {hours[0]}:00 - {hours[1]}:00\n\nЧтобы изменить, отправь новое время в формате: 09:00-21:00")
-                    else:
-                        send(chat_id, "❌ Часы работы не установлены.")
-                else:
-                    send(chat_id, "❌ Сначала зарегистрируйте бизнес через /register")
-                continue
-
-            if text == "/start":
-                start_param = None
-                if len(text.split()) > 1:
-                    start_param = text.split()[1]
-
-                if start_param:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT id, business_name FROM businesses WHERE business_slug=?", (start_param,))
-                    business = cur.fetchone()
-                    conn.close()
-
-                    if business:
-                        business_id, business_name = business
-                        client_states[user_id] = {
-                            "step": "name",
-                            "business_id": business_id,
-                            "business_name": business_name
-                        }
-                        send(chat_id, f"Добро пожаловать в {business_name}!\n\nВведите ваше имя:")
-                        continue
-                    else:
-                        send(chat_id, "❌ Барбершоп не найден")
-                        continue
-
-                if is_admin(user_id):
-                    status = get_subscription_status(user_id)
-                    business = get_admin_business(user_id)
-
-                    menu = "🤖 Админ-панель\n\n"
-                    menu += f"📊 Статус подписки: {status}\n\n"
-                    menu += "Команды:\n"
-                    menu += "/register - зарегистрировать барбершоп\n"
-                    menu += "/mybusiness - мой барбершоп\n"
-                    menu += "/addservice - добавить услугу\n"
-                    menu += "/services - мои услуги\n"
-                    menu += "/editservice - редактировать услуги\n"
-                    menu += "/deleteservice - удалить услугу\n"
-                    menu += "/bookings - записи клиентов\n"
-                    menu += "/stats - статистика\n"
-                    menu += "/workhours - часы работы\n"
-                    menu += "/getlink - получить ссылку\n"
-                    menu += "/subscription - управление подпиской"
-
-                    if user_id == MASTER_ADMIN_ID:
-                        menu += "\n\n👑 Команды главного админа:\n"
-                        menu += "/addadmin - добавить администратора\n"
-                        menu += "/admins - список администраторов"
-
-                    if "истекла" in status or "нет подписки" in status:
-                        buttons = [[{"text": "💳 Купить подписку", "callback_data": "buy_subscription"}]]
-                        send_inline_keyboard(chat_id, menu, buttons)
-                    else:
-                        send(chat_id, menu)
-                else:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT id, business_name FROM businesses WHERE is_active=1")
-                    businesses = cur.fetchall()
-                    conn.close()
-
-                    if not businesses:
-                        send(chat_id, "❌ Нет доступных барбершопов.")
-                        continue
-
-                    msg = "📋 Доступные барбершопы:\n\n"
-                    for i, biz in enumerate(businesses, 1):
-                        msg += f"{i}. {biz[1]}\n"
-                    msg += "\nВведите номер барбершопа:"
-                    client_states[user_id] = {"step": "select_business", "businesses": businesses}
-                    send(chat_id, msg)
-                continue
-
-            if text == "/subscription" and is_admin(user_id):
-                status = get_subscription_status(user_id)
-                business = get_admin_business(user_id)
-
-                if business and "истекла" not in status and "нет" not in status and business[2]:
-                    end_date = business[2]
-                    days_left = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.now()).days
-                    msg = f"💳 Управление подпиской\n\n"
-                    msg += f"📊 Статус: {status}\n"
-                    msg += f"📅 Действует до: {end_date}\n"
-                    msg += f"⏰ Осталось дней: {days_left}\n\n"
-                    msg += "Хотите продлить? Нажмите на кнопку ниже."
-                else:
-                    msg = f"💳 Управление подпиской\n\n"
-                    msg += f"📊 Статус: {status}\n\n"
-                    msg += "Подписка не активна. Нажмите на кнопку ниже для оплаты."
-
-                buttons = [[{"text": "💳 Купить/Продлить подписку", "callback_data": "buy_subscription"}]]
+    if text == "/deleteservice" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT id, service_name FROM services WHERE business_id=?", (business[0],))
+            services = cur.fetchall()
+            conn.close()
+            if services:
+                msg = "Выберите услугу для удаления:\n\n"
+                buttons = []
+                for s in services:
+                    buttons.append([{"text": f"🗑 {s[1]}", "callback_data": f"delete_service_{s[0]}"}])
+                buttons.append([{"text": "Назад", "callback_data": "back"}])
                 send_inline_keyboard(chat_id, msg, buttons)
-                continue
+            else:
+                send(chat_id, "У вас нет услуг для удаления.")
+        return
 
-            if text == "/register" and is_admin(user_id):
+    if text == "/stats" and is_admin(user_id):
+        buttons = [
+            [{"text": "За сегодня", "callback_data": "stats_day"}],
+            [{"text": "За неделю", "callback_data": "stats_week"}],
+            [{"text": "За месяц", "callback_data": "stats_month"}]
+        ]
+        send_inline_keyboard(chat_id, "📊 Выберите период для статистики:", buttons)
+        return
+
+    if text == "/workhours" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT working_start, working_end FROM businesses WHERE id=?", (business[0],))
+            hours = cur.fetchone()
+            conn.close()
+            if hours:
+                send(chat_id, f"⏰ Текущие часы работы: {hours[0]}:00 - {hours[1]}:00\n\nЧтобы изменить, отправь новое время в формате: 09:00-21:00")
+            else:
+                send(chat_id, "❌ Часы работы не установлены.")
+        else:
+            send(chat_id, "❌ Сначала зарегистрируйте бизнес через /register")
+        return
+
+    if text == "/start":
+        start_param = None
+        if len(text.split()) > 1:
+            start_param = text.split()[1]
+
+        if start_param:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT id, business_name FROM businesses WHERE business_slug=?", (start_param,))
+            business = cur.fetchone()
+            conn.close()
+
+            if business:
+                business_id, business_name = business
+                client_states[user_id] = {
+                    "step": "name",
+                    "business_id": business_id,
+                    "business_name": business_name
+                }
+                send(chat_id, f"Добро пожаловать в {business_name}!\n\nВведите ваше имя:")
+                return
+            else:
+                send(chat_id, "❌ Барбершоп не найден")
+                return
+
+        if is_admin(user_id):
+            status = get_subscription_status(user_id)
+            business = get_admin_business(user_id)
+
+            menu = "🤖 Админ-панель\n\n"
+            menu += f"📊 Статус подписки: {status}\n\n"
+            menu += "Команды:\n"
+            menu += "/register - зарегистрировать барбершоп\n"
+            menu += "/mybusiness - мой барбершоп\n"
+            menu += "/addservice - добавить услугу\n"
+            menu += "/services - мои услуги\n"
+            menu += "/editservice - редактировать услуги\n"
+            menu += "/deleteservice - удалить услугу\n"
+            menu += "/bookings - записи клиентов\n"
+            menu += "/stats - статистика\n"
+            menu += "/workhours - часы работы\n"
+            menu += "/getlink - получить ссылку\n"
+            menu += "/subscription - управление подпиской"
+
+            if user_id == MASTER_ADMIN_ID:
+                menu += "\n\n👑 Команды главного админа:\n"
+                menu += "/addadmin - добавить администратора\n"
+                menu += "/admins - список администраторов"
+
+            if "истекла" in status or "нет подписки" in status:
+                buttons = [[{"text": "💳 Купить подписку", "callback_data": "buy_subscription"}]]
+                send_inline_keyboard(chat_id, menu, buttons)
+            else:
+                send(chat_id, menu)
+        else:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT id, business_name FROM businesses WHERE is_active=1")
+            businesses = cur.fetchall()
+            conn.close()
+
+            if not businesses:
+                send(chat_id, "❌ Нет доступных барбершопов.")
+                return
+
+            msg = "📋 Доступные барбершопы:\n\n"
+            for i, biz in enumerate(businesses, 1):
+                msg += f"{i}. {biz[1]}\n"
+            msg += "\nВведите номер барбершопа:"
+            client_states[user_id] = {"step": "select_business", "businesses": businesses}
+            send(chat_id, msg)
+        return
+
+    if text == "/subscription" and is_admin(user_id):
+        status = get_subscription_status(user_id)
+        business = get_admin_business(user_id)
+
+        if business and "истекла" not in status and "нет" not in status and business[2]:
+            end_date = business[2]
+            days_left = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.now()).days
+            msg = f"💳 Управление подпиской\n\n"
+            msg += f"📊 Статус: {status}\n"
+            msg += f"📅 Действует до: {end_date}\n"
+            msg += f"⏰ Осталось дней: {days_left}\n\n"
+            msg += "Хотите продлить? Нажмите на кнопку ниже."
+        else:
+            msg = f"💳 Управление подпиской\n\n"
+            msg += f"📊 Статус: {status}\n\n"
+            msg += "Подписка не активна. Нажмите на кнопку ниже для оплаты."
+
+        buttons = [[{"text": "💳 Купить/Продлить подписку", "callback_data": "buy_subscription"}]]
+        send_inline_keyboard(chat_id, msg, buttons)
+        return
+
+    if text == "/register" and is_admin(user_id):
+        conn = sqlite3.connect("saas.db")
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM businesses WHERE owner_id=?", (user_id,))
+        existing = cur.fetchone()
+        conn.close()
+
+        if existing:
+            send(chat_id, "❌ У вас уже зарегистрирован барбершоп.")
+            return
+
+        users[user_id] = {"step": "business_name"}
+        send(chat_id, "Введите название барбершопа:")
+        return
+
+    if text == "/mybusiness" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT address, phone, working_start, working_end FROM businesses WHERE id=?",
+                        (business[0],))
+            info = cur.fetchone()
+            conn.close()
+            send(chat_id, f"🏪 {business[1]}\n📍 {info[0]}\n📞 {info[1]}\n⏰ Работаем: {info[2]}:00 - {info[3]}:00")
+        else:
+            send(chat_id, "❌ Барбершоп не зарегистрирован.")
+        return
+
+    if text == "/addservice" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if not business:
+            send(chat_id, "❌ Сначала зарегистрируйте барбершоп через /register")
+            return
+
+        if business[2]:
+            end_date = datetime.strptime(business[2], "%Y-%m-%d")
+            if end_date < datetime.now():
+                send(chat_id, "❌ Ваша подписка истекла. Продлите её через /subscription")
+                return
+
+        users[user_id] = {"step": "service_name", "business_id": business[0]}
+        send(chat_id, "Введите название услуги:")
+        return
+
+    if text == "/services" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT service_name, duration, price FROM services WHERE business_id=?",
+                        (business[0],))
+            services = cur.fetchall()
+            conn.close()
+            if services:
+                msg = "📋 Ваши услуги:\n\n"
+                for s in services:
+                    msg += f"✂️ {s[0]} - {s[2]} руб. ({s[1]} мин)\n"
+                send(chat_id, msg)
+            else:
+                send(chat_id, "У вас нет услуг. Добавьте через /addservice")
+        return
+
+    if text == "/bookings" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, client_name, client_phone, service_name, booking_date, booking_time, status FROM bookings WHERE business_id=? ORDER BY booking_date DESC",
+                (business[0],))
+            bookings = cur.fetchall()
+            conn.close()
+            if bookings:
+                msg = "📅 Записи клиентов:\n\n"
+                for b in bookings:
+                    status_emoji = "✅" if b[6] == "confirmed" else "⏳" if b[6] == "pending" else "❌"
+                    msg += f"{status_emoji} #{b[0]}: {b[1]} ({b[2]})\n💇 {b[3]}\n📅 {b[4]} {b[5]}\n\n"
+                send(chat_id, msg)
+            else:
+                send(chat_id, "Нет записей")
+        return
+
+    if text == "/getlink" and is_admin(user_id):
+        business = get_admin_business(user_id)
+        if business:
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("SELECT business_slug FROM businesses WHERE owner_id=?", (user_id,))
+            slug = cur.fetchone()
+            conn.close()
+            if slug and slug[0]:
+                link = f"https://t.me/{BOT_USERNAME}?start={slug[0]}"
+                send(chat_id, f"🔗 Ваша ссылка для клиентов:\n\n{link}\n\nОтправьте её клиентам!")
+            else:
+                send(chat_id, "❌ Ошибка: не удалось получить ссылку")
+        return
+
+    # Обработка состояний (регистрация, добавление услуг и т.д.)
+    # ... (продолжение следует)
+    # Обработка добавления администратора (только для главного админа)
+    if user_id == MASTER_ADMIN_ID and user_id in users and users[user_id].get("step") == "add_admin":
+        try:
+            new_admin_id = int(text)
+            
+            # Проверяем, есть ли у этого пользователя бизнес
+            business = get_admin_business(new_admin_id)
+            if not business:
+                send(chat_id, f"❌ Пользователь `{new_admin_id}` не зарегистрировал барбершоп. Сначала попросите его пройти регистрацию через /register")
+                del users[user_id]
+                return
+            
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?, ?, ?)", 
+                        (new_admin_id, business[0], user_id))
+            conn.commit()
+            conn.close()
+            
+            send(chat_id, f"✅ Пользователь `{new_admin_id}` добавлен как администратор.")
+            send(new_admin_id, f"🎉 Вас добавили как администратора бота! Используйте /start для входа в админ-панель.")
+            del users[user_id]
+        except ValueError:
+            send(chat_id, "❌ Неверный формат ID. Введите только цифры.")
+        except Exception as e:
+            send(chat_id, f"❌ Ошибка: {e}")
+            del users[user_id]
+        return
+
+    # Обработка состояний для регистрации бизнеса и добавления услуг
+    if user_id in users:
+        state = users[user_id]
+
+        if state.get("step") == "business_name":
+            state["business_name"] = text
+            state["step"] = "address"
+            send(chat_id, "Введите адрес барбершопа:")
+            return
+
+        if state.get("step") == "address":
+            state["address"] = text
+            state["step"] = "phone"
+            send(chat_id, "Введите телефон барбершопа:")
+            return
+
+        if state.get("step") == "phone":
+            slug = generate_unique_slug(state["business_name"], user_id)
+            trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+
+            try:
                 conn = sqlite3.connect("saas.db")
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM businesses WHERE owner_id=?", (user_id,))
-                existing = cur.fetchone()
+
+                cur.execute("""
+                    INSERT INTO businesses (owner_id, business_name, business_slug, address, phone, subscription_end, is_trial, working_start, working_end) 
+                    VALUES (?,?,?,?,?,?,1,9,21)
+                """, (user_id, state["business_name"], slug, state["address"], text, trial_end))
+
+                business_id = cur.lastrowid
+                cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?,?,?)",
+                            (user_id, business_id, MASTER_ADMIN_ID))
+
+                conn.commit()
                 conn.close()
 
-                if existing:
-                    send(chat_id, "❌ У вас уже зарегистрирован барбершоп.")
-                    continue
+                link = f"https://t.me/{BOT_USERNAME}?start={slug}"
+                send(chat_id, f"✅ Барбершоп успешно зарегистрирован!\n\n"
+                              f"🏪 {state['business_name']}\n"
+                              f"📍 {state['address']}\n"
+                              f"📞 {text}\n\n"
+                              f"🎁 Пробный период: {TRIAL_DAYS} дней бесплатно!\n"
+                              f"📅 Подписка активна до: {trial_end}\n\n"
+                              f"🔗 Ваша ссылка:\n{link}\n\n"
+                              f"📋 Теперь добавьте услуги через /addservice")
 
-                users[user_id] = {"step": "business_name"}
-                send(chat_id, "Введите название барбершопа:")
-                continue
+                del users[user_id]
 
-            if text == "/mybusiness" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT address, phone, working_start, working_end FROM businesses WHERE id=?",
-                                (business[0],))
-                    info = cur.fetchone()
-                    conn.close()
-                    send(chat_id, f"🏪 {business[1]}\n📍 {info[0]}\n📞 {info[1]}\n⏰ Работаем: {info[2]}:00 - {info[3]}:00")
-                else:
-                    send(chat_id, "❌ Барбершоп не зарегистрирован.")
-                continue
+            except Exception as e:
+                send(chat_id, f"❌ Ошибка: {e}")
+                del users[user_id]
+            return
 
-            if text == "/addservice" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if not business:
-                    send(chat_id, "❌ Сначала зарегистрируйте барбершоп через /register")
-                    continue
+        if state.get("step") == "service_name":
+            state["service_name"] = text
+            state["step"] = "duration"
+            send(chat_id, "Введите длительность в минутах:")
+            return
 
-                if business[2]:
-                    end_date = datetime.strptime(business[2], "%Y-%m-%d")
-                    if end_date < datetime.now():
-                        send(chat_id, "❌ Ваша подписка истекла. Продлите её через /subscription")
-                        continue
+        if state.get("step") == "duration":
+            if text.isdigit():
+                state["duration"] = int(text)
+                state["step"] = "price"
+                send(chat_id, "Введите стоимость в рублях:")
+            else:
+                send(chat_id, "❌ Введите число")
+            return
 
-                users[user_id] = {"step": "service_name", "business_id": business[0]}
-                send(chat_id, "Введите название услуги:")
-                continue
-
-            if text == "/services" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT service_name, duration, price FROM services WHERE business_id=?",
-                                (business[0],))
-                    services = cur.fetchall()
-                    conn.close()
-                    if services:
-                        msg = "📋 Ваши услуги:\n\n"
-                        for s in services:
-                            msg += f"✂️ {s[0]} - {s[2]} руб. ({s[1]} мин)\n"
-                        send(chat_id, msg)
-                    else:
-                        send(chat_id, "У вас нет услуг. Добавьте через /addservice")
-                continue
-
-            if text == "/bookings" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
+        if state.get("step") == "price":
+            if text.isdigit():
+                try:
                     conn = sqlite3.connect("saas.db")
                     cur = conn.cursor()
                     cur.execute(
-                        "SELECT id, client_name, client_phone, service_name, booking_date, booking_time, status FROM bookings WHERE business_id=? ORDER BY booking_date DESC",
-                        (business[0],))
-                    bookings = cur.fetchall()
-                    conn.close()
-                    if bookings:
-                        msg = "📅 Записи клиентов:\n\n"
-                        for b in bookings:
-                            status_emoji = "✅" if b[6] == "confirmed" else "⏳" if b[6] == "pending" else "❌"
-                            msg += f"{status_emoji} #{b[0]}: {b[1]} ({b[2]})\n💇 {b[3]}\n📅 {b[4]} {b[5]}\n\n"
-                        send(chat_id, msg)
-                    else:
-                        send(chat_id, "Нет записей")
-                continue
-
-            if text == "/getlink" and is_admin(user_id):
-                business = get_admin_business(user_id)
-                if business:
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("SELECT business_slug FROM businesses WHERE owner_id=?", (user_id,))
-                    slug = cur.fetchone()
-                    conn.close()
-                    if slug and slug[0]:
-                        link = f"https://t.me/{BOT_USERNAME}?start={slug[0]}"
-                        send(chat_id, f"🔗 Ваша ссылка для клиентов:\n\n{link}\n\nОтправьте её клиентам!")
-                    else:
-                        send(chat_id, "❌ Ошибка: не удалось получить ссылку")
-                continue
-
-            # Обработка добавления администратора (только для главного админа)
-            if user_id == MASTER_ADMIN_ID and user_id in users and users[user_id].get("step") == "add_admin":
-                try:
-                    new_admin_id = int(text)
-                    
-                    # Проверяем, есть ли у этого пользователя бизнес
-                    business = get_admin_business(new_admin_id)
-                    if not business:
-                        send(chat_id, f"❌ Пользователь `{new_admin_id}` не зарегистрировал барбершоп. Сначала попросите его пройти регистрацию через /register")
-                        del users[user_id]
-                        continue
-                    
-                    conn = sqlite3.connect("saas.db")
-                    cur = conn.cursor()
-                    cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?, ?, ?)", 
-                                (new_admin_id, business[0], user_id))
+                        "INSERT INTO services (business_id, service_name, duration, price) VALUES (?,?,?,?)",
+                        (state["business_id"], state["service_name"], state["duration"], int(text)))
                     conn.commit()
                     conn.close()
-                    
-                    send(chat_id, f"✅ Пользователь `{new_admin_id}` добавлен как администратор.")
-                    send(new_admin_id, f"🎉 Вас добавили как администратора бота! Используйте /start для входа в админ-панель.")
+                    send(chat_id, f"✅ Услуга '{state['service_name']}' добавлена!")
                     del users[user_id]
-                except ValueError:
-                    send(chat_id, "❌ Неверный формат ID. Введите только цифры.")
                 except Exception as e:
                     send(chat_id, f"❌ Ошибка: {e}")
                     del users[user_id]
-                continue
+            else:
+                send(chat_id, "❌ Введите число")
+            return
 
-            if user_id in editing_states and editing_states[user_id].get("step") == "edit_start":
-                if text.isdigit():
-                    hour = int(text)
-                    if 0 <= hour <= 23:
-                        editing_states[user_id]["start"] = hour
-                        editing_states[user_id]["step"] = "edit_end"
-                        send(chat_id,
-                             f"Время начала: {hour}:00\n\nВведите время окончания работы (в часах от 0 до 23):")
-                    else:
-                        send(chat_id, "❌ Введите число от 0 до 23")
-                else:
-                    send(chat_id, "❌ Введите число")
-                continue
+    # Обработка редактирования времени работы
+    if user_id in editing_states and editing_states[user_id].get("step") == "edit_start":
+        if text.isdigit():
+            hour = int(text)
+            if 0 <= hour <= 23:
+                editing_states[user_id]["start"] = hour
+                editing_states[user_id]["step"] = "edit_end"
+                send(chat_id,
+                     f"Время начала: {hour}:00\n\nВведите время окончания работы (в часах от 0 до 23):")
+            else:
+                send(chat_id, "❌ Введите число от 0 до 23")
+        else:
+            send(chat_id, "❌ Введите число")
+        return
 
-            if user_id in editing_states and editing_states[user_id].get("step") == "edit_end":
-                if text.isdigit():
-                    hour = int(text)
-                    if 0 <= hour <= 23:
-                        business = get_admin_business(user_id)
-                        if business:
-                            start_hour = editing_states[user_id]["start"]
-                            conn = sqlite3.connect("saas.db")
-                            cur = conn.cursor()
-                            cur.execute("UPDATE businesses SET working_start=?, working_end=? WHERE id=?",
-                                        (start_hour, hour, business[0]))
-                            conn.commit()
-                            conn.close()
-                            send(chat_id, f"✅ Часы работы обновлены: {start_hour}:00 - {hour}:00")
-                        del editing_states[user_id]
-                    else:
-                        send(chat_id, "❌ Введите число от 0 до 23")
-                else:
-                    send(chat_id, "❌ Введите число")
-                continue
-
-            if user_id in editing_states:
-                state = editing_states[user_id]
-
-                if state.get("step") == "edit_name":
+    if user_id in editing_states and editing_states[user_id].get("step") == "edit_end":
+        if text.isdigit():
+            hour = int(text)
+            if 0 <= hour <= 23:
+                business = get_admin_business(user_id)
+                if business:
+                    start_hour = editing_states[user_id]["start"]
                     conn = sqlite3.connect("saas.db")
                     cur = conn.cursor()
-                    cur.execute("UPDATE services SET service_name=? WHERE id=?", (text, state["service_id"]))
+                    cur.execute("UPDATE businesses SET working_start=?, working_end=? WHERE id=?",
+                                (start_hour, hour, business[0]))
                     conn.commit()
                     conn.close()
-                    send(chat_id, f"✅ Название услуги изменено на: {text}")
-                    del editing_states[user_id]
-                    continue
+                    send(chat_id, f"✅ Часы работы обновлены: {start_hour}:00 - {hour}:00")
+                del editing_states[user_id]
+            else:
+                send(chat_id, "❌ Введите число от 0 до 23")
+        else:
+            send(chat_id, "❌ Введите число")
+        return
 
-                if state.get("step") == "edit_duration":
-                    if text.isdigit():
-                        conn = sqlite3.connect("saas.db")
-                        cur = conn.cursor()
-                        cur.execute("UPDATE services SET duration=? WHERE id=?", (int(text), state["service_id"]))
-                        conn.commit()
-                        conn.close()
-                        send(chat_id, f"✅ Длительность изменена на: {text} минут")
-                        del editing_states[user_id]
-                    else:
-                        send(chat_id, "❌ Введите число")
-                    continue
+    # Обработка редактирования услуги
+    if user_id in editing_states:
+        state = editing_states[user_id]
 
-                if state.get("step") == "edit_price":
-                    if text.isdigit():
-                        conn = sqlite3.connect("saas.db")
-                        cur = conn.cursor()
-                        cur.execute("UPDATE services SET price=? WHERE id=?", (int(text), state["service_id"]))
-                        conn.commit()
-                        conn.close()
-                        send(chat_id, f"✅ Цена изменена на: {text} руб.")
-                        del editing_states[user_id]
-                    else:
-                        send(chat_id, "❌ Введите число")
-                    continue
+        if state.get("step") == "edit_name":
+            conn = sqlite3.connect("saas.db")
+            cur = conn.cursor()
+            cur.execute("UPDATE services SET service_name=? WHERE id=?", (text, state["service_id"]))
+            conn.commit()
+            conn.close()
+            send(chat_id, f"✅ Название услуги изменено на: {text}")
+            del editing_states[user_id]
+            return
 
-            if user_id in users:
-                state = users[user_id]
+        if state.get("step") == "edit_duration":
+            if text.isdigit():
+                conn = sqlite3.connect("saas.db")
+                cur = conn.cursor()
+                cur.execute("UPDATE services SET duration=? WHERE id=?", (int(text), state["service_id"]))
+                conn.commit()
+                conn.close()
+                send(chat_id, f"✅ Длительность изменена на: {text} минут")
+                del editing_states[user_id]
+            else:
+                send(chat_id, "❌ Введите число")
+            return
 
-                if state.get("step") == "business_name":
-                    state["business_name"] = text
-                    state["step"] = "address"
-                    send(chat_id, "Введите адрес барбершопа:")
-                    continue
+        if state.get("step") == "edit_price":
+            if text.isdigit():
+                conn = sqlite3.connect("saas.db")
+                cur = conn.cursor()
+                cur.execute("UPDATE services SET price=? WHERE id=?", (int(text), state["service_id"]))
+                conn.commit()
+                conn.close()
+                send(chat_id, f"✅ Цена изменена на: {text} руб.")
+                del editing_states[user_id]
+            else:
+                send(chat_id, "❌ Введите число")
+            return
 
-                if state.get("step") == "address":
-                    state["address"] = text
-                    state["step"] = "phone"
-                    send(chat_id, "Введите телефон барбершопа:")
-                    continue
+    # Обработка состояний клиента
+    if user_id in client_states:
+        state = client_states[user_id]
 
-                if state.get("step") == "phone":
-                    slug = generate_unique_slug(state["business_name"], user_id)
-                    trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+        if state.get("step") == "select_business":
+            if text.isdigit():
+                idx = int(text) - 1
+                if 0 <= idx < len(state["businesses"]):
+                    biz = state["businesses"][idx]
+                    state["business_id"] = biz[0]
+                    state["business_name"] = biz[1]
+                    state["step"] = "name"
+                    send(chat_id, f"✅ Вы выбрали {biz[1]}\n\nВведите ваше имя:")
+                else:
+                    send(chat_id, f"❌ Введите число от 1 до {len(state['businesses'])}")
+            else:
+                send(chat_id, "❌ Введите номер барбершопа")
+            return
 
-                    try:
-                        conn = sqlite3.connect("saas.db")
-                        cur = conn.cursor()
+        if state.get("step") == "name":
+            if text.strip():
+                state["client_name"] = text.strip()
+                state["step"] = "phone"
+                send(chat_id, "Введите ваш номер телефона:")
+            else:
+                send(chat_id, "❌ Имя не может быть пустым")
+            return
 
-                        cur.execute("""
-                            INSERT INTO businesses (owner_id, business_name, business_slug, address, phone, subscription_end, is_trial, working_start, working_end) 
-                            VALUES (?,?,?,?,?,?,1,9,21)
-                        """, (user_id, state["business_name"], slug, state["address"], text, trial_end))
+        if state.get("step") == "phone":
+            if text.strip():
+                state["client_phone"] = text.strip()
+                conn = sqlite3.connect("saas.db")
+                cur = conn.cursor()
+                cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
+                            (state["business_id"],))
+                services = cur.fetchall()
+                conn.close()
 
-                        business_id = cur.lastrowid
-                        cur.execute("INSERT OR REPLACE INTO admins (user_id, business_id, added_by) VALUES (?,?,?)",
-                                    (user_id, business_id, MASTER_ADMIN_ID))
+                if not services:
+                    send(chat_id, "❌ В этом барбершопе пока нет услуг")
+                    del client_states[user_id]
+                    return
 
-                        conn.commit()
-                        conn.close()
+                state["services"] = services
+                state["step"] = "service"
 
-                        link = f"https://t.me/{BOT_USERNAME}?start={slug}"
-                        send(chat_id, f"✅ Барбершоп успешно зарегистрирован!\n\n"
-                                      f"🏪 {state['business_name']}\n"
-                                      f"📍 {state['address']}\n"
-                                      f"📞 {text}\n\n"
-                                      f"🎁 Пробный период: {TRIAL_DAYS} дней бесплатно!\n"
-                                      f"📅 Подписка активна до: {trial_end}\n\n"
-                                      f"🔗 Ваша ссылка:\n{link}\n\n"
-                                      f"📋 Теперь добавьте услуги через /addservice")
+                msg = "📋 Выберите услугу:\n\n"
+                for i, s in enumerate(services, 1):
+                    msg += f"{i}. {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
+                msg += "\nВведите номер услуги:"
+                send(chat_id, msg)
+            else:
+                send(chat_id, "❌ Телефон не может быть пустым")
+            return
 
-                        del users[user_id]
+        if state.get("step") == "service":
+            if text.isdigit():
+                idx = int(text) - 1
+                if 0 <= idx < len(state["services"]):
+                    state["service_name"] = state["services"][idx][1]
+                    state["step"] = "date"
+                    send(chat_id, "Введите дату в формате ГГГГ-ММ-ДД:\nПример: 2024-12-31")
+                else:
+                    send(chat_id, f"❌ Введите число от 1 до {len(state['services'])}")
+            else:
+                send(chat_id, "❌ Введите номер услуги")
+            return
 
-                    except Exception as e:
-                        send(chat_id, f"❌ Ошибка: {e}")
-                        del users[user_id]
-                    continue
+        if state.get("step") == "date":
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', text):
+                if datetime.strptime(text, "%Y-%m-%d") < datetime.now().replace(hour=0, minute=0, second=0):
+                    send(chat_id, "❌ Нельзя записаться на прошедшую дату.")
+                    return
+                state["booking_date"] = text
+                state["step"] = "time"
+                send(chat_id, "Введите время в формате ЧЧ:ММ:\nПример: 14:30")
+            else:
+                send(chat_id, "❌ Неверный формат. Используйте ГГГГ-ММ-ДД")
+            return
 
-                if state.get("step") == "service_name":
-                    state["service_name"] = text
-                    state["step"] = "duration"
-                    send(chat_id, "Введите длительность в минутах:")
-                    continue
+        if state.get("step") == "time":
+            if re.match(r'^\d{2}:\d{2}$', text):
+                is_valid, error_msg = is_valid_booking_time(state["business_id"], state["booking_date"], text)
+                if not is_valid:
+                    send(chat_id, f"❌ {error_msg}")
+                    return
 
-                if state.get("step") == "duration":
-                    if text.isdigit():
-                        state["duration"] = int(text)
-                        state["step"] = "price"
-                        send(chat_id, "Введите стоимость в рублях:")
-                    else:
-                        send(chat_id, "❌ Введите число")
-                    continue
+                state["booking_time"] = text
 
-                if state.get("step") == "price":
-                    if text.isdigit():
-                        try:
-                            conn = sqlite3.connect("saas.db")
-                            cur = conn.cursor()
-                            cur.execute(
-                                "INSERT INTO services (business_id, service_name, duration, price) VALUES (?,?,?,?)",
-                                (state["business_id"], state["service_name"], state["duration"], int(text)))
-                            conn.commit()
-                            conn.close()
-                            send(chat_id, f"✅ Услуга '{state['service_name']}' добавлена!")
-                            del users[user_id]
-                        except Exception as e:
-                            send(chat_id, f"❌ Ошибка: {e}")
-                            del users[user_id]
-                    else:
-                        send(chat_id, "❌ Введите число")
-                    continue
+                try:
+                    conn = sqlite3.connect("saas.db")
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO bookings (business_id, client_id, client_name, client_phone, service_name, booking_date, booking_time, status)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (state["business_id"], user_id, state["client_name"], state["client_phone"],
+                          state["service_name"], state["booking_date"], state["booking_time"], "pending"))
 
-            if user_id in client_states:
-                state = client_states[user_id]
+                    booking_id = cur.lastrowid
+                    conn.commit()
 
-                if state.get("step") == "select_business":
-                    if text.isdigit():
-                        idx = int(text) - 1
-                        if 0 <= idx < len(state["businesses"]):
-                            biz = state["businesses"][idx]
-                            state["business_id"] = biz[0]
-                            state["business_name"] = biz[1]
-                            state["step"] = "name"
-                            send(chat_id, f"✅ Вы выбрали {biz[1]}\n\nВведите ваше имя:")
-                        else:
-                            send(chat_id, f"❌ Введите число от 1 до {len(state['businesses'])}")
-                    else:
-                        send(chat_id, "❌ Введите номер барбершопа")
-                    continue
+                    cur.execute("SELECT owner_id FROM businesses WHERE id=?", (state["business_id"],))
+                    admin_id = cur.fetchone()[0]
+                    conn.close()
 
-                if state.get("step") == "name":
-                    if text.strip():
-                        state["client_name"] = text.strip()
-                        state["step"] = "phone"
-                        send(chat_id, "Введите ваш номер телефона:")
-                    else:
-                        send(chat_id, "❌ Имя не может быть пустым")
-                    continue
+                    send(chat_id, f"✅ Вы успешно записаны!\n\n"
+                                  f"👤 Имя: {state['client_name']}\n"
+                                  f"📞 Телефон: {state['client_phone']}\n"
+                                  f"✂️ Барбершоп: {state['business_name']}\n"
+                                  f"💇 Услуга: {state['service_name']}\n"
+                                  f"📅 Дата: {state['booking_date']}\n"
+                                  f"⏰ Время: {state['booking_time']}\n\n"
+                                  f"Статус: ожидает подтверждения")
 
-                if state.get("step") == "phone":
-                    if text.strip():
-                        state["client_phone"] = text.strip()
-                        conn = sqlite3.connect("saas.db")
-                        cur = conn.cursor()
-                        cur.execute("SELECT id, service_name, duration, price FROM services WHERE business_id=?",
-                                    (state["business_id"],))
-                        services = cur.fetchall()
-                        conn.close()
+                    booking_info = {
+                        'booking_id': booking_id,
+                        'client_name': state['client_name'],
+                        'client_phone': state['client_phone'],
+                        'service_name': state['service_name'],
+                        'booking_date': state['booking_date'],
+                        'booking_time': state['booking_time']
+                    }
+                    send_admin_notification(admin_id, booking_info)
 
-                        if not services:
-                            send(chat_id, "❌ В этом барбершопе пока нет услуг")
-                            del client_states[user_id]
-                            continue
+                    del client_states[user_id]
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка: {e}")
+                    del client_states[user_id]
+            else:
+                send(chat_id, "❌ Неверный формат. Используйте ЧЧ:ММ")
+            return
 
-                        state["services"] = services
-                        state["step"] = "service"
 
-                        msg = "📋 Выберите услугу:\n\n"
-                        for i, s in enumerate(services, 1):
-                            msg += f"{i}. {s[1]} - {s[3]} руб. ({s[2]} мин)\n"
-                        msg += "\nВведите номер услуги:"
-                        send(chat_id, msg)
-                    else:
-                        send(chat_id, "❌ Телефон не может быть пустым")
-                    continue
+@app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    """Telegram отправляет обновления сюда"""
+    update = request.get_json()
+    if update:
+        process_update(update)
+    return jsonify({"status": "ok"})
 
-                if state.get("step") == "service":
-                    if text.isdigit():
-                        idx = int(text) - 1
-                        if 0 <= idx < len(state["services"]):
-                            state["service_name"] = state["services"][idx][1]
-                            state["step"] = "date"
-                            send(chat_id, "Введите дату в формате ГГГГ-ММ-ДД:\nПример: 2024-12-31")
-                        else:
-                            send(chat_id, f"❌ Введите число от 1 до {len(state['services'])}")
-                    else:
-                        send(chat_id, "❌ Введите номер услуги")
-                    continue
 
-                if state.get("step") == "date":
-                    if re.match(r'^\d{4}-\d{2}-\d{2}$', text):
-                        if datetime.strptime(text, "%Y-%m-%d") < datetime.now().replace(hour=0, minute=0, second=0):
-                            send(chat_id, "❌ Нельзя записаться на прошедшую дату.")
-                            continue
-                        state["booking_date"] = text
-                        state["step"] = "time"
-                        send(chat_id, "Введите время в формате ЧЧ:ММ:\nПример: 14:30")
-                    else:
-                        send(chat_id, "❌ Неверный формат. Используйте ГГГГ-ММ-ДД")
-                    continue
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({"status": "Bot is running"})
 
-                if state.get("step") == "time":
-                    if re.match(r'^\d{2}:\d{2}$', text):
-                        is_valid, error_msg = is_valid_booking_time(state["business_id"], state["booking_date"], text)
-                        if not is_valid:
-                            send(chat_id, f"❌ {error_msg}")
-                            continue
 
-                        state["booking_time"] = text
-
-                        try:
-                            conn = sqlite3.connect("saas.db")
-                            cur = conn.cursor()
-                            cur.execute("""
-                                INSERT INTO bookings (business_id, client_id, client_name, client_phone, service_name, booking_date, booking_time, status)
-                                VALUES (?,?,?,?,?,?,?,?)
-                            """, (state["business_id"], user_id, state["client_name"], state["client_phone"],
-                                  state["service_name"], state["booking_date"], state["booking_time"], "pending"))
-
-                            booking_id = cur.lastrowid
-                            conn.commit()
-
-                            cur.execute("SELECT owner_id FROM businesses WHERE id=?", (state["business_id"],))
-                            admin_id = cur.fetchone()[0]
-                            conn.close()
-
-                            send(chat_id, f"✅ Вы успешно записаны!\n\n"
-                                          f"👤 Имя: {state['client_name']}\n"
-                                          f"📞 Телефон: {state['client_phone']}\n"
-                                          f"✂️ Барбершоп: {state['business_name']}\n"
-                                          f"💇 Услуга: {state['service_name']}\n"
-                                          f"📅 Дата: {state['booking_date']}\n"
-                                          f"⏰ Время: {state['booking_time']}\n\n"
-                                          f"Статус: ожидает подтверждения")
-
-                            booking_info = {
-                                'booking_id': booking_id,
-                                'client_name': state['client_name'],
-                                'client_phone': state['client_phone'],
-                                'service_name': state['service_name'],
-                                'booking_date': state['booking_date'],
-                                'booking_time': state['booking_time']
-                            }
-                            send_admin_notification(admin_id, booking_info)
-
-                            del client_states[user_id]
-                        except Exception as e:
-                            send(chat_id, f"❌ Ошибка: {e}")
-                            del client_states[user_id]
-                    else:
-                        send(chat_id, "❌ Неверный формат. Используйте ЧЧ:ММ")
-                    continue
-
+def set_webhook():
+    """Устанавливает вебхук при запуске бота"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    webhook_url = f"https://{BOT_USERNAME}.onrender.com/webhook/{BOT_TOKEN}"
+    try:
+        response = requests.post(url, json={"url": webhook_url})
+        print("Webhook установлен:", response.json())
     except Exception as e:
-        print(f"Ошибка в основном цикле: {e}")
+        print(f"Ошибка установки вебхука: {e}")
+
+
+if __name__ == "__main__":
+    set_webhook()
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Бот запущен на порту {port}")
+    app.run(host="0.0.0.0", port=port)
 
